@@ -20,17 +20,6 @@ u8 AMS_KEYGEN{}; // set on startup
 u64 AMS_HASH{}; // set on startup
 bool VERSION_SKIP{}; // set on startup
 
-struct DebugEventInfo {
-    u32 event_type;
-    u32 flags;
-    u64 thread_id;
-    u64 title_id;
-    u64 process_id;
-    char process_name[12];
-    u32 mmu_flags;
-    u8 _0x30[0x10];
-};
-
 template<typename T>
 constexpr void str2hex(const char* s, T* data, u8& size) {
     // skip leading 0x (if any)
@@ -267,7 +256,7 @@ constinit Patterns olsc_patterns[] = {
 };
 
 constinit Patterns nifm_patterns[] = {
-    { "ctest_1.0.0-19.0.1", "0x03.AAE003.AA...39..04F8....E0", -29, 0, ctest_cond, ctest_patch, ctest_applied, true, FW_VER_ANY, MAKEHOSVERSION(18,1,0) },
+    { "ctest_1.0.0-19.0.1", "0x03.AAE003.AA...39..04F8....E0", -29, 0, ctest_cond, ctest_patch, ctest_applied, true, FW_VER_ANY, MAKEHOSVERSION(19,0,1) },
     { "ctest_20.0.0+", "0x03.AA...AA.........0314AA..14AA", -17, 0, ctest_cond, ctest_patch, ctest_applied, true, MAKEHOSVERSION(20,0,0), FW_VER_ANY },
 };
 
@@ -409,7 +398,7 @@ auto apply_patch(PatchEntry& patch) -> bool {
     for (s32 i = 0; i < (process_count - 1); i++) {
         if (R_SUCCEEDED(svcDebugActiveProcess(&handle, pids[i])) &&
             R_SUCCEEDED(svcGetDebugEvent(&event_info, handle)) &&
-            patch.title_id == event_info.title_id) {
+            patch.title_id == event_info.info.create_process.program_id) {
             MemoryInfo mem_info{};
             u64 addr{};
             u32 page_info{};
