@@ -3,7 +3,7 @@
 #include <algorithm> // for std::min
 #include <bit> // for std::byteswap
 #include <utility> // std::unreachable
-#include <switch.h>
+#include "switch.h"
 #include "minIni/minIni.h"
 
 namespace {
@@ -239,7 +239,7 @@ constinit Patterns ldr_patterns[] = {
 };
 
 constinit Patterns erpt_patterns[] = {
-    { "no_erpt", "0x...D1FD7B02A9FD830091F76305A9", 0, 0, sub_cond, mov0_ret_patch, mov0_ret_applied, true, FW_VER_ANY }, // FF4305D1 - sub sp, sp, #0x150 patched to E0031F2AC0035FD6 - mov w0, wzr, ret 
+    { "no_erpt", "0x...D1FD7B02A9FD830091F76305A9", 0, 0, sub_cond, mov0_ret_patch, mov0_ret_applied, true, FW_VER_ANY }, // FF4305D1 - sub sp, sp, #0x150 patched to E0031F2AC0035FD6 - mov w0, wzr, ret
 };
 
 constinit Patterns es_patterns[] = {
@@ -562,6 +562,333 @@ void keygen_to_str(char* s, u8 keygen) {
 
 } // namespace
 
+extern "C" {
+static int patch_utf8_to_utf16(const u8 *utf8_in, u16 *utf16_out) {
+    u32 cp = 0;          // 临时存放码点
+    u8 first = utf8_in[0];
+    int utf8_len = 0;
+
+    // 1字节UTF-8：0xxxxxxx
+    if (first <= 0x7F) {
+        cp = first;
+        *utf16_out = (u16)cp;
+        utf8_len = 1;
+    }
+    // 2字节UTF-8：110xxxxx 10xxxxxx
+    else if ((first & 0xE0) == 0xC0) {
+        cp = ((first & 0x1F) << 6) | (utf8_in[1] & 0x3F);
+        *utf16_out = (u16)cp;
+        utf8_len = 2;
+    }
+    // 3字节UTF-8：1110xxxx 10xxxxxx 10xxxxxx
+    else if ((first & 0xF0) == 0xE0) {
+        cp = ((first & 0x0F) << 12) | ((utf8_in[1] & 0x3F) << 6) | (utf8_in[2] & 0x3F);
+        *utf16_out = (u16)cp;
+        utf8_len = 3;
+    }
+    // 4字节UTF-8：11110xxx ...（对应U+10000~U+10FFFF），需代理对，不支持
+    else if ((first & 0xF8) == 0xF0) {
+        *utf16_out = L'_';
+        utf8_len = 4;
+    } else {
+        *utf16_out = L'_';
+        utf8_len = 1;
+    }
+
+    return (utf8_len << 16) | 2;
+}
+
+// static void patch_utf8_to_utf16_end(void) {}
+}
+
+extern "C" {
+static int patch_utf16_to_utf8(const u16 *utf16_in, u8 *utf8_output)
+{
+    u16 utf16_char = *utf16_in;
+    int utf8_len = 0;
+
+    // 检查是否为代理对（U+D800 ~ U+DFFF），本函数不支持此类输入
+    // if (utf16_char >= 0xD800 && utf16_char <= 0xDFFF) {
+    //     return -1;  // 错误：遇到代理对，无法单独转换
+    // }
+
+    if (utf16_char <= 0x007F) {
+        // 1字节UTF-8：0xxxxxxx
+        utf8_output[0] = (uint8_t)utf16_char;
+        utf8_output[2] = '\0';
+        utf8_len = 1;
+    } else if (utf16_char <= 0x07FF) {
+        // 2字节UTF-8：110xxxxx 10xxxxxx
+        utf8_output[0] = 0xC0 | (uint8_t)(utf16_char >> 6);      // 高5位
+        utf8_output[1] = 0x80 | (uint8_t)(utf16_char & 0x3F);    // 低6位
+        utf8_len = 2;
+    } else {
+        // 3字节UTF-8：1110xxxx 10xxxxxx 10xxxxxx
+        utf8_output[0] = 0xE0 | (uint8_t)(utf16_char >> 12);          // 高4位
+        utf8_output[1] = 0x80 | (uint8_t)((utf16_char >> 6) & 0x3F);  // 中间6位
+        utf8_output[2] = 0x80 | (uint8_t)(utf16_char & 0x3F);         // 低6位
+        utf8_len = 3;
+    }
+
+    return (utf8_len << 16) | 2;
+}
+
+// static void patch_utf16_to_utf8_end(void) {}
+}
+
+extern "C" {
+static int patch_is_oem_mb_char(u8 ch, int byte_idx)
+{
+    if (ch <= 0x7F) {
+        // 1字节UTF-8：0xxxxxxx
+        return 0;
+    } else if ((ch & 0xE0) == 0xC0) {
+        // 2字节UTF-8：110xxxxx 10xxxxxx
+        return 1;
+    } else if ((ch & 0xF0) == 0xE0) {
+        // 3字节UTF-8：1110xxxx 10xxxxxx 10xxxxxx
+        return 2;
+    } else if ((ch & 0xF8) == 0xF0) {
+        // 4字节UTF-8：11110xxx ...（对应U+10000~U+10FFFF）
+        return 3;
+    } else {
+        // 中间字节
+        return 1;
+    }
+}
+
+// static void patch_is_oem_mb_char_end(void) {}
+}
+
+const char *fs_codepage_patch_result = "default";
+static char tmp_buffer[256] = {0};
+u64 tmp_addr = 0;
+u64 tmp_size = 0;
+
+void buff_to_str(char *str, const u8 *buff, u32 len)
+{
+    u32 i;
+
+    constexpr auto a = [](u8 nib) -> char {
+        if (nib >= 0 && nib <= 9) {
+            return '0' + nib;
+        } else {
+            return 'a' + nib - 10;
+        }
+    };
+
+    for (i = 0; i < len; i++) {
+        *str++ = a(buff[i] >> 4);
+        *str++ = a(buff[i] & 0xf);
+        *str++ = ' ';
+    }
+
+    *str = 0;
+}
+
+int fs_patch_function(Handle handle, u64 addr, const u8 *cmp_bytes, int cmp_len, const void *func_addr, int func_size)
+{
+    u8 buffer[0x20] = {0};
+
+    if (R_FAILED(svcReadDebugProcessMemory(buffer, handle, addr, cmp_len))) {
+        return -1;
+    }
+
+    if (memcmp(buffer, cmp_bytes, cmp_len) != 0) {
+        buff_to_str(tmp_buffer, buffer, cmp_len);
+        return -2;
+    }
+
+    if (R_FAILED(svcWriteDebugProcessMemory(handle, func_addr, addr, func_size))) {
+        return -3;
+    }
+
+    return 0;
+}
+
+void fs_codepage_patch(void)
+{
+    Handle handle{};
+    DebugEventInfo event_info{};
+    u64 pids[0x50]{};
+    s32 process_count{};
+    int ret = 0;
+
+    if (R_FAILED(svcGetProcessList(&process_count, pids, 0x50))) {
+        return;
+    }
+
+    for (s32 i = 0; i < (process_count - 1); i++) {
+        if (R_SUCCEEDED(svcDebugActiveProcess(&handle, pids[i])) &&
+            R_SUCCEEDED(svcGetDebugEvent(&event_info, handle)) &&
+            0x0100000000000000 == event_info.info.create_process.program_id) {
+            MemoryInfo mem_info{};
+            u64 addr{};
+            u32 page_info{};
+
+            for (;;) {
+                if (R_FAILED(svcQueryDebugProcessMemory(&mem_info, &page_info, handle, addr))) {
+                    break;
+                }
+                addr = mem_info.addr + mem_info.size;
+
+                // if addr=0 then we hit the reserved memory section
+                if (!addr) {
+                    break;
+                }
+                // skip memory that we don't want
+                if (!mem_info.size || (mem_info.perm & Perm_Rx) != Perm_Rx || ((mem_info.type & 0xFF) != MemType_CodeStatic)) {
+                    continue;
+                }
+
+                tmp_addr = mem_info.addr;
+                tmp_size = mem_info.size;
+
+                // 跳过emummc等代码
+                if (mem_info.size < 0x100000) {
+                    continue;
+                }
+
+                // fat32
+                // const u8 fat32_cmp_bytes[16] = {
+                //     0x0b, 0x00, 0x40, 0x79, 0x7f, 0xfd, 0x01, 0x71, 0xc8, 0x00, 0x00, 0x54, 0x2b, 0x00, 0x00, 0x39
+                // };
+                // fs_patch_function(handle, mem_info.addr + 0xced30, fat32_cmp_bytes, sizeof(fat32_cmp_bytes),
+                //     (void *)patch_utf16_to_utf8, (uintptr_t)patch_utf16_to_utf8_end - (uintptr_t)patch_utf16_to_utf8);
+
+                // exfat
+
+                // patch IDirectory_Read，不校验字符是否合法，解决只能返回英文的问题
+                const u8 exfat_IDirectory_Read[] = {0xe3, 0xfc, 0xff, 0x54}; // b.cc name_check_err
+                const u8 exfat_IDirectory_Read_patch[] = {0x1F, 0x20, 0x03, 0xD5}; // nop
+                ret = fs_patch_function(handle, mem_info.addr + 0xd4af4, exfat_IDirectory_Read, sizeof(exfat_IDirectory_Read),
+                    exfat_IDirectory_Read_patch, sizeof(exfat_IDirectory_Read_patch));
+                if (ret != 0) {
+                    fs_codepage_patch_result = "exfat_IDirectory_Read_patch failed";
+                    break;
+                }
+                // patch PFCODE_CP932_Unicode2OEM
+                const u8 exfat_PFCODE_CP932_Unicode2OEM[16] = {
+                    0x0a, 0x00, 0x40, 0x79, 0x5f, 0xfd, 0x01, 0x71, 0xc8, 0x00, 0x00, 0x54, 0x2a, 0x00, 0x00, 0x39
+                };
+                ret = fs_patch_function(handle, mem_info.addr + 0xfec30, exfat_PFCODE_CP932_Unicode2OEM, sizeof(exfat_PFCODE_CP932_Unicode2OEM),
+                    (void *)patch_utf16_to_utf8, 0x70);
+                if (ret != 0) {
+                    fs_codepage_patch_result = "patch_utf16_to_utf8 failed";
+                    break;
+                }
+
+                // patch PFCODE_CP932_OEM2Unicode
+                const u8 exfat_PFCODE_CP932_OEM2Unicode[16] = {
+                    0x08, 0x00, 0xc0, 0x39, 0x0a, 0x1d, 0x00, 0x12, 0xa8, 0x00, 0xf8, 0x37, 0x20, 0x00, 0x80, 0x52
+                };
+                ret = fs_patch_function(handle, mem_info.addr + 0xfeac0, exfat_PFCODE_CP932_OEM2Unicode, sizeof(exfat_PFCODE_CP932_OEM2Unicode),
+                    (void *)patch_utf8_to_utf16, 0x98);
+                if (ret != 0) {
+                    fs_codepage_patch_result = "patch_utf8_to_utf16 failed";
+                    break;
+                }
+
+                // patch PFCODE_CP932_isOEMMBchar
+                const u8 exfat_PFCODE_CP932_isOEMMBchar[16] = {
+                    0x08, 0x00, 0x01, 0x51, 0x49, 0x00, 0x80, 0x12, 0x3f, 0x81, 0x20, 0x6b, 0x08, 0x1d, 0x00, 0x12
+                };
+                ret = fs_patch_function(handle, mem_info.addr + 0xfee40, exfat_PFCODE_CP932_isOEMMBchar, sizeof(exfat_PFCODE_CP932_isOEMMBchar),
+                    (void *)patch_is_oem_mb_char, 0x50);
+                if (ret != 0) {
+                    fs_codepage_patch_result = "patch_is_oem_mb_char failed";
+                    break;
+                }
+
+                // 以下是对isOEMMBchar调用处进行patch
+
+                // patch FAT_GetNextChar (0xf45d8): 将 add x9, x8, #1 改为 add x9, x8, x0
+                // 使ptr_left根据patch_is_oem_mb_char的返回值跳过1/2/3个字节
+                const u8 exfat_FAT_GetNextChar[] = {
+                    0xe0, 0x00, 0x00, 0x34, // cbz w0, label_continue
+                    0x88, 0x02, 0x40, 0xf9, // ldr x8, [x20]
+                    0x09, 0x05, 0x00, 0x91, // add x9, x8, #0x1  <-- 需要修改
+                    0x89, 0x02, 0x00, 0xf9, // str x9, [x20]
+                    0x08, 0x01, 0x40, 0x39, // ldrb w8, [x8]
+                    0x15, 0x21, 0x15, 0x2a, // orr w21, w8, w21, lsl #8
+                    0xe8, 0x17, 0x00, 0x39, // strb w8, [sp, #0x5]
+                    0x68, 0x3e, 0x00, 0x12  // and w8, w19, #0xff
+                };
+                const u8 exfat_FAT_GetNextChar_patch[] = {
+                    0xe0, 0x00, 0x00, 0x34, // cbz w0, label_continue
+                    0x88, 0x02, 0x40, 0xf9, // ldr x8, [x20]
+                    0x09, 0x00, 0x00, 0x8b, // add x9, x8, x0  <-- 用w0做增量
+                    0x89, 0x02, 0x00, 0xf9, // str x9, [x20]
+                    0x08, 0x01, 0x40, 0x79, // ldrh w8, [x8]
+                    0x15, 0x21, 0x15, 0x2a, // orr w21, w8, w21, lsl #8
+                    0xe8, 0x53, 0x00, 0x78, // strh w8, [sp, #0x5]
+                    0x68, 0x3e, 0x00, 0x12  // and w8, w19, #0xff
+                };
+                ret = fs_patch_function(handle, mem_info.addr + 0xf45d8, exfat_FAT_GetNextChar, sizeof(exfat_FAT_GetNextChar),
+                    exfat_FAT_GetNextChar_patch, sizeof(exfat_FAT_GetNextChar_patch));
+                if (ret != 0) {
+                    fs_codepage_patch_result = "exfat_FAT_GetNextChar failed";
+                    break;
+                }
+
+                const u8 exfat_FAT_GetNextPathComponent[] = {0x09, 0x05, 0x00, 0x91}; // add x9, x8, #0x1
+                const u8 exfat_FAT_GetNextPathComponent_patch[] = {0x09, 0x01, 0x00, 0x8B}; // add x9, x8, x0
+                ret = fs_patch_function(handle, mem_info.addr + 0xf4d8c, exfat_FAT_GetNextPathComponent, sizeof(exfat_FAT_GetNextPathComponent),
+                    exfat_FAT_GetNextPathComponent_patch, sizeof(exfat_FAT_GetNextPathComponent_patch));
+                if (ret != 0) {
+                    fs_codepage_patch_result = "exfat_FAT_GetNextPathComponent failed";
+                    break;
+                }
+
+                const u8 exfat_AddLeft[] = {0xC8, 0x06, 0x96, 0x1A}; // cinc w8, w22, ne
+                const u8 exfat_AddLeft_patch[] = {0xC8, 0x02, 0x00, 0x0B}; // add w8, w22, w0
+                ret = fs_patch_function(handle, mem_info.addr + 0xf77e8, exfat_AddLeft, sizeof(exfat_AddLeft),
+                    exfat_AddLeft_patch, sizeof(exfat_AddLeft_patch));
+                if (ret != 0) {
+                    fs_codepage_patch_result = "exfat_AddLeft_patch failed";
+                    break;
+                }
+
+                const u8 exfat_GetCharCount[] = {0x73, 0x06, 0x93, 0x9a}; // cinc x19 ,x19 ,ne
+                const u8 exfat_GetCharCount_patch[] = {0x73, 0x02, 0x00, 0x8B}; // add x19, x19, x0
+                ret = fs_patch_function(handle, mem_info.addr + 0xf7984, exfat_GetCharCount, sizeof(exfat_GetCharCount),
+                    exfat_GetCharCount_patch, sizeof(exfat_GetCharCount_patch));
+                if (ret != 0) {
+                    fs_codepage_patch_result = "exfat_GetCharCount_patch failed";
+                    break;
+                }
+
+                const u8 exfat_CompareUnicode[] = {0x68, 0x02, 0x96, 0x9a}; // csel x8, x19, x22, eq
+                const u8 exfat_CompareUnicode_patch[] = {0x68, 0x02, 0x00, 0x8B}; // add x8, x19, x0
+                ret = fs_patch_function(handle, mem_info.addr + 0xf7a80, exfat_CompareUnicode, sizeof(exfat_CompareUnicode),
+                    exfat_CompareUnicode_patch, sizeof(exfat_CompareUnicode_patch));
+                if (ret != 0) {
+                    fs_codepage_patch_result = "exfat_CompareUnicode_patch failed";
+                    break;
+                }
+
+                const u8 exfat_CompareOem[] = {0x94, 0x02, 0x97, 0x9A}; // csel x20, x20, x23, eq
+                const u8 exfat_CompareOem_patch[] = {0x94, 0x02, 0x00, 0x8B}; // add x20, x20, x0
+                ret = fs_patch_function(handle, mem_info.addr + 0xf7bd0, exfat_CompareOem, sizeof(exfat_CompareOem),
+                    exfat_CompareOem_patch, sizeof(exfat_CompareOem_patch));
+                if (ret != 0) {
+                    fs_codepage_patch_result = "exfat_CompareOem_patch failed";
+                    break;
+                }
+
+                fs_codepage_patch_result = "success";
+                break;
+            }
+
+            svcCloseHandle(handle);
+            return;
+        } else if (handle) {
+            svcCloseHandle(handle);
+            handle = 0;
+        }
+    }
+}
+
 int main(int argc, char* argv[]) {
     constexpr auto ini_path = "/config/sys-patch/config.ini";
     constexpr auto log_path = "/config/sys-patch/log.ini";
@@ -606,6 +933,7 @@ int main(int argc, char* argv[]) {
         for (auto& patch : patches) {
             apply_patch(patch);
         }
+        fs_codepage_patch();
     }
 
     const auto ticks_end = armGetSystemTick();
@@ -655,6 +983,14 @@ int main(int argc, char* argv[]) {
         ini_putl("stats", "heap_size", INNER_HEAP_SIZE, log_path);
         ini_putl("stats", "buffer_size", READ_BUFFER_SIZE, log_path);
         ini_puts("stats", "patch_time", patch_time, log_path);
+
+        ini_puts("debug", "fs_codepage_patch_result", fs_codepage_patch_result, log_path);
+        ini_puts("debug", "tmp_buffer", tmp_buffer, log_path);
+        char tmp_str[64] = "";
+        buff_to_str(tmp_str, (u8 *)&tmp_addr, sizeof(tmp_addr));
+        ini_puts("debug", "tmp_addr", tmp_str, log_path);
+        buff_to_str(tmp_str, (u8 *)&tmp_size, sizeof(tmp_size));
+        ini_puts("debug", "tmp_size", tmp_str, log_path);
     }
 
     // note: sysmod exits here.
