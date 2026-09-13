@@ -291,7 +291,9 @@ typedef struct FsDrvObject {
     u32  dwField_0xc0;                     /* 0x0c0 per-volume config flags (from storage driver) */
     u16  wVolume_config_0xc4;              /* 0x0c4 max-cluster config value */
     u16  wVolume_config_0xc6;              /* 0x0c6 cluster-size config value */
-    u32  dwCode_page_state;                /* 0x0c8 code-page ctx: 0=uninit, 1=initialized (fat_init_code_page_context @0x128? no: @drv+0x128) */
+    u32  dwCode_page_state;                /* 0x0c8 code-page ctx state: 0=uninit, 1=initialized
+                                            *      (target of fat_init_code_page_context, which
+                                            *      also uses qLock_0x128 as its object slot) */
     u8   _reserved0xcc[4];                 /* 0x0cc */
     void *pCode_page_slot;                 /* 0x0d0 allocated PFCODE/CP932 slot */
     u8   _reserved0xd8[0x10];              /* 0x0d8 */
