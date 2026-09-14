@@ -555,8 +555,8 @@ FsObject 缓冲派生，创建与打开自洽；互操作残余风险仅无效 U
 | 编号 | 位置 | 问题 | 影响面 |
 |---|---|---|---|
 | R1 | FAT_MatchWildcardRecursive 0x71000f4770（0xf4874/0xf49ac/0xf4a7c） | "若多字节则指针+1"未改，3 字节 UTF-8 失步 | 短名回退匹配、通配符 |
-| R2 | FAT_MakeShortName 0x71000f5ac0（4 处 isMB） | 8.3 短名按 2 字节估算空间，UTF-8 可能超长/截断 | 创建、重命名 |
-| R3 | FAT_ReplaceShortNameNumber 0x71000f6270 | 同上 | 重名短名生成 |
+| R2 | FAT_MakeShortName 0x71000f5ac0（0xf5dcc，2026-09-14 复核定案） | 实际用 pOEMCharWidth（ctx+0x28）非 isMB；补丁后宽 3 字符进入 2 字节拷贝循环（`subs w23,#2` 永不归零）→ **FAT32 创建中文文件名死循环**；修复 = `mov w23,w0`→`mov w23,#2`（宽按 2+1 消费，字节不丢） | 创建、重命名（FAT32） |
+| R3 | FAT_ReplaceShortNameNumber 0x71000f6270 | **误报（2026-09-14 复核）**：用 pOEMCharWidth（ctx+0x28）逐字符推进（w23+=width），补丁后宽度自动正确，无需补丁 | — |
 | R4 | StringDesc_ToUpper 0x71000f7c10 | OEM 分支有符号 toupper 逐字节，UTF-8 高位字节可能被改写 | 大写比较（写路径） |
 | R5 | patch_utf8_to_utf16 | 3/4 字节分支无条件读 in[1..2] | 越界读（NUL 保护，低风险） |
 | R6 | patch_utf16_to_utf8 | 2/3 字节分支不写 NUL | 依赖调用方补 NUL |
@@ -568,6 +568,9 @@ FsObject 缓冲派生，创建与打开自洽；互操作残余风险仅无效 U
 ① 给 Unicode2OEM 调用点加边界（H1，独立于症状）；② R1/R2/R3 改"+返回值"；
 ③ R4 逐字符或 ASCII-only；⑥ R6 补 NUL；⑦ R7 对齐续字节语义。
 完整方案见早期记录与 `sysmod/src/main.cpp` 现行实现。
+
+**2026-09-14 实施记录**（详见 `re_improve_plan.md` 末尾实施状态）：R7/R6/R5/H1/R4/R1×3/R2 已全部
+落入 main.cpp 并编译验证（函数尺寸经 nm 实测）；R3 复核为误报无需补丁。
 
 ---
 

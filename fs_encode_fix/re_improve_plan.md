@@ -109,3 +109,22 @@
 - H1 方案 A 的替换函数体大小是硬约束（0x120），编码前先看 `-Os` 产物尺寸；超限即转方案 B。
 - R1/R2/R3 的 csel→add 改写必须逐处核对原指令的条件语义，防止把"分支选择"误改成"无条件累加"。
 - 所有偏移仍无版本门控前，跨固件升级后必须重新核对 `cmp_bytes` 失配日志（`log.ini [debug]`）再放行。
+
+---
+
+## 6. 实施状态（2026-09-14，全部落入 sysmod/src/main.cpp 并编译验证）
+
+| 项 | 状态 | 实现方式 | 关键偏移/尺寸 |
+|---|---|---|---|
+| R7 | ✅ | isOEMMBchar 续字节返 0（与转换器 len=1 自洽） | 函数尺寸 0x44（原 0x50） |
+| R6 | ✅ | utf16_to_utf8 2 字节分支补 `out[2]='\0'` | 函数尺寸 0x7C（原 0x70） |
+| R5 | ✅ | 2/3/4 字节分支续字节短路校验（NUL/非法 → `'_'` len=1），防越界读 | 函数尺寸 0xEC（原 0x98） |
+| H1 | ✅ | 有界替换 PFCODE_Str_Unicode2OEM：512 字节截断 + NUL，双模式（普通/特殊映射）忠实复刻；经 GOT 0x710024eb50 取 ctx，ctx+0x20 取回调，ctx+0x48 bit1 判模式；返回值恒 0 | @0xf5840，尺寸 0x110 ≤ 0x120 硬约束 |
+| R4 | ✅ | 替换 StringDesc_ToUpper：OEM 分支 ASCII-only（≥0x80 直通），Unicode 分支按原语义 | @0xf7c10，尺寸 0x98 ≤ 0xD0 硬约束 |
+| R1 | ✅ | 3 处 `add wN,wM,#1/#2` → `add wN,wM,w0` | @0xf4888 / 0xf49c4 / 0xf4a90 |
+| R2 | ✅（升级为致命 bug 修复） | Ghidra 复核：MakeShortName 用 pOEMCharWidth 而非 isMB；宽 3 字符使 `subs w23,#2` 拷贝循环永不归零 → FAT32 创建中文名**死循环**。修复：`mov w23,w0`→`mov w23,#2`（宽 3 按 2+1 消费，字节不丢、循环正常退出） | @0xf5dcc |
+| R3 | ⛔ 误报 | 复核：ReplaceShortNameNumber 用 pOEMCharWidth（ctx+0x28）逐字符推进，补丁后宽度自动正确，无需补丁 | — |
+
+**函数尺寸纪律**：`PATCH_SZ_*` 常量必须与编译产物精确一致（nm -S 实测；改动任一 patch_* 函数后必须复核）。过小截断指令 → fs 崩溃；过大把相邻 sysmod 代码写入 fs。
+**编译验证**：make 全量通过（sysmod sys-patch.nsp 13:59），两个替换函数反汇编复核无 adrp（绝对地址 movz/movk 物化，PC 无关）。
+**待上机回归**：FAT32 创建中文文件名（原死循环点）、长中文名（>170 字符截断行为）、通配符搜索、重命名、`<N>` 索引打开。

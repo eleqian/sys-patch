@@ -563,6 +563,10 @@ void keygen_to_str(char* s, u8 keygen) {
 } // namespace
 
 extern "C" {
+// R5：续字节校验——3/4 字节分支会读 in[1..3]，必须确认是 0x80~0xBF
+// 的合法续字节，防止路径尾截断时越界读 + 防止与调用方步进失步。
+static inline bool utf8_cont_ok(u8 b) { return (b & 0xC0) == 0x80; }
+
 static int patch_utf8_to_utf16(const u8 *utf8_in, u16 *utf16_out) {
     u32 cp = 0;          // 临时存放码点
     u8 first = utf8_in[0];
@@ -576,18 +580,33 @@ static int patch_utf8_to_utf16(const u8 *utf8_in, u16 *utf16_out) {
     }
     // 2字节UTF-8：110xxxxx 10xxxxxx
     else if ((first & 0xE0) == 0xC0) {
+        if (!utf8_cont_ok(utf8_in[1])) {
+            *utf16_out = L'_';
+            return (1 << 16) | 2;   // 非法输入按 1 字节 '_' 处理
+        }
         cp = ((first & 0x1F) << 6) | (utf8_in[1] & 0x3F);
         *utf16_out = (u16)cp;
         utf8_len = 2;
     }
     // 3字节UTF-8：1110xxxx 10xxxxxx 10xxxxxx
     else if ((first & 0xF0) == 0xE0) {
+        if (!utf8_cont_ok(utf8_in[1]) || !utf8_cont_ok(utf8_in[2])) {
+            *utf16_out = L'_';
+            return (1 << 16) | 2;
+        }
         cp = ((first & 0x0F) << 12) | ((utf8_in[1] & 0x3F) << 6) | (utf8_in[2] & 0x3F);
         *utf16_out = (u16)cp;
         utf8_len = 3;
     }
     // 4字节UTF-8：11110xxx ...（对应U+10000~U+10FFFF），需代理对，不支持
     else if ((first & 0xF8) == 0xF0) {
+        // 4字节UTF-8：11110xxx ...（对应U+10000~U+10FFFF），需代理对，不支持。
+        // 短路校验续字节（R5）：前一字节非法/NUL 时不再读后续字节，
+        // 防止越过字符串结尾的越界读；无效输入按 1 字节 '_' 处理。
+        if (!utf8_cont_ok(utf8_in[1]) || !utf8_cont_ok(utf8_in[2]) || !utf8_cont_ok(utf8_in[3])) {
+            *utf16_out = L'_';
+            return (1 << 16) | 2;
+        }
         *utf16_out = L'_';
         utf8_len = 4;
     } else {
@@ -621,6 +640,7 @@ static int patch_utf16_to_utf8(const u16 *utf16_in, u8 *utf8_output)
         // 2字节UTF-8：110xxxxx 10xxxxxx
         utf8_output[0] = 0xC0 | (uint8_t)(utf16_char >> 6);      // 高5位
         utf8_output[1] = 0x80 | (uint8_t)(utf16_char & 0x3F);    // 低6位
+        utf8_output[2] = '\0';                                   // R6: 与1字节分支及原CP932约定对齐
         utf8_len = 2;
     } else {
         // 3字节UTF-8：1110xxxx 10xxxxxx 10xxxxxx
@@ -652,15 +672,131 @@ static int patch_is_oem_mb_char(u8 ch, int byte_idx)
         // 4字节UTF-8：11110xxx ...（对应U+10000~U+10FFFF）
         return 3;
     } else {
-        // 中间字节
-        return 1;
+        // 续字节/非法字节（R7）：与 patch_utf8_to_utf16 对续字节按 len=1
+        // 处理保持自洽——返回 0 使 GetNextChar 补丁点只走原有固定 +1，
+        // 避免转换器(前进1)与步进(前进2)失步。byte_idx 忽略。
+        (void)byte_idx;
+        return 0;
     }
 }
 
 // static void patch_is_oem_mb_char_end(void) {}
 }
 
+extern "C" {
+/* H1：字符串级 Unicode→OEM 转换有界替换（原 PFCODE_Str_Unicode2OEM @0x71000f5840）。
+ * 原版对输出缓冲无上限——fat_init_fs_object_shortname 向 dirInfo+0x487 的
+ * lname[513] 写入时，UTF-8 下 ≥171 个 CJK 字符即溢出（H1）。
+ * 本替换在 512 字节处截断（含 NUL 共 ≤513），修复溢出；
+ * >170 个 CJK 字符的长名会被截断，属于可接受的权衡。
+ * 忠实复刻原函数两种模式：
+ *  - 普通模式：逐字符调用 ctx+0x20（pUnicode2OEM，已被替换为 UTF-16→UTF-8），
+ *    输出前进 oem 宽度（ret>>16）、输入前进 uni 宽度/2 个字符；
+ *  - 特殊映射模式（ctx+0x48 bit1，MakeShortName 生成 8.3 占位名用）：
+ *    '.'→'.'、' '→' '、其余→'_'。
+ * 返回值恒 0（与原版一致）。
+ * 尺寸硬约束：0x71000f5960 是下一个函数（Str_OEM2Unicode），本函数体必须 ≤0x120。 */
+typedef int (*patch_uni2oem_fn)(const u16 *src, u8 *dst);
+typedef int (*patch_strncmpw_fn)(const void *a, const void *b, int n);
+
+static int patch_str_unicode2oem(char *dst_oem, const u16 *src_uni)
+{
+    u8 *ctx = *(u8 **)0x710024eb50ULL;          /* PFCODE_CODE_PAGE_CONTEXT（经 GOT） */
+    patch_uni2oem_fn conv = *(patch_uni2oem_fn *)(void *)(ctx + 0x20);
+    const u16 *in = src_uni;
+    char *out = dst_oem;
+    char *limit = dst_oem + 512;                /* H1：输出上限 */
+
+    if (ctx[0x48] & 2) {
+        /* 特殊映射模式 */
+        u16 dot = 0x2e, sp = 0x20;
+        patch_strncmpw_fn sw = (patch_strncmpw_fn)0x71000de560ULL;
+        while (*in != 0 && out < limit) {
+            if (sw(in, &dot, 1) == 0) {
+                *out++ = '.';
+            } else {
+                *out++ = (sw(in, &sp, 1) == 0) ? ' ' : '_';
+            }
+            in++;
+        }
+    } else {
+        /* 普通转换模式 */
+        while (*in != 0 && out < limit) {
+            int ret = conv(in, (u8 *)out);
+            out += (short)(ret >> 16);                  /* oem 字节宽 */
+            in += ((short)(ret & 0xffff)) >> 1;         /* uni 字符宽 */
+        }
+    }
+    *out = '\0';
+    return 0;
+}
+}
+
+extern "C" {
+/* R4：StringDesc_ToUpper 有界替换（原 @0x71000f7c10）。
+ * 原版 OEM 分支对 signed char 调 toupper，UTF-8 高位字节（≥0x80）被当作
+ * 负数传入 ctype 表，行为未定义且可能改写名字字节。
+ * 本替换 OEM 分支改 ASCII-only：仅 'a'-'z' 大写，≥0x80 原样保留。
+ * Unicode 分支与原版一致（u16 逐字符，'a'-'z' 大写）。
+ * StringDesc 布局见 fs_structs.h：ptr_left@0x00、encode_type@0x10（ENCODE_OEM=1）。
+ * 尺寸硬约束：0x71000f7ce0 是下一个函数（PFCODE_CP932_ConvertWidth），
+ * 本函数体必须 ≤0xD0。 */
+typedef struct {
+    void *ptr_left;
+    void *ptr_right;
+    int   encode_type;
+    u32   rsvd;
+} FsStrDescLite;
+
+static void patch_stringdesc_toupper(FsStrDescLite *path, short maxLen, char *dst)
+{
+    if (path->encode_type != 1 /* ENCODE_OEM */) {
+        u16 *p = (u16 *)path->ptr_left;
+        u16 *d = (u16 *)dst;
+        while (maxLen != 0) {
+            u16 c = *p++;
+            if (c == 0) {
+                break;
+            }
+            if ((unsigned)(c - 'a') < 26u) {
+                c = (u16)(c - 0x20);
+            }
+            *d++ = c;
+            maxLen--;
+        }
+        *d = 0;
+    } else {
+        u8 *p = (u8 *)path->ptr_left;
+        while (maxLen != 0) {
+            u8 c = *p;
+            if (c == 0) {
+                break;
+            }
+            if ((unsigned)(c - 'a') < 26u) {
+                c = (u8)(c - 0x20);
+            }
+            *dst++ = (char)c;
+            p++;
+            maxLen--;
+        }
+        *dst = '\0';
+    }
+}
+}
+
 const char *fs_codepage_patch_result = "default";
+
+/* 补丁函数体实际尺寸（字节）——必须与编译产物精确一致（用
+ * aarch64-none-elf-nm -S 测量），改动任一 patch_* 函数后必须复核：
+ * 过小会把函数截断在指令中间（fs 崩溃），过大则会把相邻 sysmod 代码写入 fs。
+ * 约束：PATCH_SZ_STR_UNICODE2OEM ≤ 0x120（0x71000f5960 为下一函数，实测 0x110）、
+ *       PATCH_SZ_TOUPPER ≤ 0xD0（0x71000f7ce0 为下一函数，实测 0x98）。 */
+#define PATCH_SZ_UTF8_TO_UTF16     0xEC
+#define PATCH_SZ_UTF16_TO_UTF8     0x7C
+#define PATCH_SZ_IS_OEM_MB_CHAR    0x44
+#define PATCH_SZ_STR_UNICODE2OEM   0x110
+#define PATCH_SZ_TOUPPER           0x98
+
 static char tmp_buffer[256] = {0};
 u64 tmp_addr = 0;
 u64 tmp_size = 0;
@@ -772,7 +908,7 @@ void fs_codepage_patch(void)
                     0x0a, 0x00, 0x40, 0x79, 0x5f, 0xfd, 0x01, 0x71, 0xc8, 0x00, 0x00, 0x54, 0x2a, 0x00, 0x00, 0x39
                 };
                 ret = fs_patch_function(handle, mem_info.addr + 0xfec30, exfat_PFCODE_CP932_Unicode2OEM, sizeof(exfat_PFCODE_CP932_Unicode2OEM),
-                    (void *)patch_utf16_to_utf8, 0x70);
+                    (void *)patch_utf16_to_utf8, PATCH_SZ_UTF16_TO_UTF8);
                 if (ret != 0) {
                     fs_codepage_patch_result = "patch_utf16_to_utf8 failed";
                     break;
@@ -783,7 +919,7 @@ void fs_codepage_patch(void)
                     0x08, 0x00, 0xc0, 0x39, 0x0a, 0x1d, 0x00, 0x12, 0xa8, 0x00, 0xf8, 0x37, 0x20, 0x00, 0x80, 0x52
                 };
                 ret = fs_patch_function(handle, mem_info.addr + 0xfeac0, exfat_PFCODE_CP932_OEM2Unicode, sizeof(exfat_PFCODE_CP932_OEM2Unicode),
-                    (void *)patch_utf8_to_utf16, 0x98);
+                    (void *)patch_utf8_to_utf16, PATCH_SZ_UTF8_TO_UTF16);
                 if (ret != 0) {
                     fs_codepage_patch_result = "patch_utf8_to_utf16 failed";
                     break;
@@ -794,7 +930,7 @@ void fs_codepage_patch(void)
                     0x08, 0x00, 0x01, 0x51, 0x49, 0x00, 0x80, 0x12, 0x3f, 0x81, 0x20, 0x6b, 0x08, 0x1d, 0x00, 0x12
                 };
                 ret = fs_patch_function(handle, mem_info.addr + 0xfee40, exfat_PFCODE_CP932_isOEMMBchar, sizeof(exfat_PFCODE_CP932_isOEMMBchar),
-                    (void *)patch_is_oem_mb_char, 0x50);
+                    (void *)patch_is_oem_mb_char, PATCH_SZ_IS_OEM_MB_CHAR);
                 if (ret != 0) {
                     fs_codepage_patch_result = "patch_is_oem_mb_char failed";
                     break;
@@ -873,6 +1009,78 @@ void fs_codepage_patch(void)
                     exfat_CompareOem_patch, sizeof(exfat_CompareOem_patch));
                 if (ret != 0) {
                     fs_codepage_patch_result = "exfat_CompareOem_patch failed";
+                    break;
+                }
+
+                // R1: FAT_MatchWildcardRecursive 三处 isOEMMBchar 调用点，
+                // “多字节则 idx 再 +1”改为“+ 返回值”（返回值=额外字节数），
+                // 使 1/2/3 字节 UTF-8 字符分别前进 1/2/3 字节。
+                // add w10,w9,#1 → add w10,w9,w0
+                const u8 wc_add1_cmp[] = {0x2A, 0x05, 0x00, 0x11};
+                const u8 wc_add1_patch[] = {0x4A, 0x05, 0x00, 0x0B};
+                ret = fs_patch_function(handle, mem_info.addr + 0xf4888, wc_add1_cmp, sizeof(wc_add1_cmp),
+                    wc_add1_patch, sizeof(wc_add1_patch));
+                if (ret != 0) {
+                    fs_codepage_patch_result = "wildcard_0xf4888 failed";
+                    break;
+                }
+                // add w8,w25,#2 → add w8,w25,w0
+                const u8 wc_add2_cmp[] = {0x28, 0x0B, 0x00, 0x11};
+                const u8 wc_add2_patch[] = {0x28, 0x0B, 0x00, 0x0B};
+                ret = fs_patch_function(handle, mem_info.addr + 0xf49c4, wc_add2_cmp, sizeof(wc_add2_cmp),
+                    wc_add2_patch, sizeof(wc_add2_patch));
+                if (ret != 0) {
+                    fs_codepage_patch_result = "wildcard_0xf49c4 failed";
+                    break;
+                }
+                // add w10,w9,#1 → add w10,w9,w0
+                ret = fs_patch_function(handle, mem_info.addr + 0xf4a90, wc_add1_cmp, sizeof(wc_add1_cmp),
+                    wc_add1_patch, sizeof(wc_add1_patch));
+                if (ret != 0) {
+                    fs_codepage_patch_result = "wildcard_0xf4a90 failed";
+                    break;
+                }
+
+                // R2: FAT_MakeShortName 多字节宽度钳制。
+                // 原版按 OEMCharWidth 返回值 w0 作为字符宽度走 2 字节拷贝循环
+                // （subs w23,#2 直到 0）；UTF-8 宽 3/4 时循环永不归零 → 死循环。
+                // 钳制为 2：3 字节字符按 2+1 消费（字节不丢、循环正常退出），
+                // 8.3 短名空间估算退回 CP932 的 2 字节/字行为。
+                // mov w23,w0 → mov w23,#2
+                const u8 msn_movw23_cmp[] = {0xF7, 0x03, 0x00, 0x2A};
+                const u8 msn_movw23_patch[] = {0x57, 0x00, 0x80, 0x52};
+                ret = fs_patch_function(handle, mem_info.addr + 0xf5dcc, msn_movw23_cmp, sizeof(msn_movw23_cmp),
+                    msn_movw23_patch, sizeof(msn_movw23_patch));
+                if (ret != 0) {
+                    fs_codepage_patch_result = "makeshortname_0xf5dcc failed";
+                    break;
+                }
+
+                // H1: PFCODE_Str_Unicode2OEM 有界替换（输出 ≤512 字节 + NUL），
+                // 修复 fat_init_fs_object_shortname 向 lname[513] 的溢出。
+                // 替换函数体必须 ≤0x120（0x71000f5960 是下一个函数）。
+                const u8 exfat_Str_Unicode2OEM[16] = {
+                    0xFF, 0x43, 0x01, 0xD1, 0xFD, 0x7B, 0x01, 0xA9,
+                    0xF7, 0x13, 0x00, 0xF9, 0xF6, 0x57, 0x03, 0xA9
+                };
+                ret = fs_patch_function(handle, mem_info.addr + 0xf5840, exfat_Str_Unicode2OEM, sizeof(exfat_Str_Unicode2OEM),
+                    (void *)patch_str_unicode2oem, PATCH_SZ_STR_UNICODE2OEM);
+                if (ret != 0) {
+                    fs_codepage_patch_result = "patch_str_unicode2oem failed";
+                    break;
+                }
+
+                // R4: StringDesc_ToUpper OEM 分支 ASCII-only 替换
+                // （原版对 signed char 调 toupper，高位字节未定义行为）。
+                // 替换函数体必须 ≤0xD0（0x71000f7ce0 是下一个函数）。
+                const u8 exfat_StringDesc_ToUpper[16] = {
+                    0xFD, 0x7B, 0xBD, 0xA9, 0xF5, 0x0B, 0x00, 0xF9,
+                    0xF4, 0x4F, 0x02, 0xA9, 0xFD, 0x03, 0x00, 0x91
+                };
+                ret = fs_patch_function(handle, mem_info.addr + 0xf7c10, exfat_StringDesc_ToUpper, sizeof(exfat_StringDesc_ToUpper),
+                    (void *)patch_stringdesc_toupper, PATCH_SZ_TOUPPER);
+                if (ret != 0) {
+                    fs_codepage_patch_result = "patch_stringdesc_toupper failed";
                     break;
                 }
 
