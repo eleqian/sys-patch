@@ -128,3 +128,11 @@
 **函数尺寸纪律**：`PATCH_SZ_*` 常量必须与编译产物精确一致（nm -S 实测；改动任一 patch_* 函数后必须复核）。过小截断指令 → fs 崩溃；过大把相邻 sysmod 代码写入 fs。
 **编译验证**：make 全量通过（sysmod sys-patch.nsp 13:59），两个替换函数反汇编复核无 adrp（绝对地址 movz/movk 物化，PC 无关）。
 **待上机回归**：FAT32 创建中文文件名（原死循环点）、长中文名（>170 字符截断行为）、通配符搜索、重命名、`<N>` 索引打开。
+
+**2026-09-15 补充**：`PATCH_SZ_*` 宏已废除。每个 patch_* 函数放入独立 `.text.<函数名>`
+section，函数体后放 `<函数名>_end` 汇编标签，运行时尺寸 = 标签地址 − 函数地址
+（`patch_code_size()`，sysmod/src/main.cpp）。**前提**：sysmod CXXFLAGS 必须带
+`-fno-toplevel-reorder`，否则 GCC 把顶层 asm 提前发射、函数体延迟发射，尺寸恒为 0。
+构建期守卫 `sysmod/tools/check_patch_sizes.py` 改为校验：标签距离 == ELF st_size
+（防标签错位）且 ≤ 空洞（FUNCTIONS 表：0xfeac0→0x170、0xfec30→0x1D0、0xfee40→0x4C、
+0xf5840→0x120、0xf7c10→0xD0，换固件版本须重推）。实测尺寸：0xEC/0x7C/0x44/0x110/0x94。

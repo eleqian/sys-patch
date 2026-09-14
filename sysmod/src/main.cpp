@@ -567,6 +567,7 @@ extern "C" {
 // 的合法续字节，防止路径尾截断时越界读 + 防止与调用方步进失步。
 static inline bool utf8_cont_ok(u8 b) { return (b & 0xC0) == 0x80; }
 
+__attribute__((used, section(".text.patch_utf8_to_utf16")))
 static int patch_utf8_to_utf16(const u8 *utf8_in, u16 *utf16_out) {
     u32 cp = 0;          // 临时存放码点
     u8 first = utf8_in[0];
@@ -617,10 +618,12 @@ static int patch_utf8_to_utf16(const u8 *utf8_in, u16 *utf16_out) {
     return (utf8_len << 16) | 2;
 }
 
-// static void patch_utf8_to_utf16_end(void) {}
+// 函数体结束标签：尺寸 = patch_utf8_to_utf16_end − patch_utf8_to_utf16（自动，构建期守卫校验）
+__asm__(".section .text.patch_utf8_to_utf16,\"ax\",@progbits\n\t.global patch_utf8_to_utf16_end\npatch_utf8_to_utf16_end:\n\t.previous");
 }
 
 extern "C" {
+__attribute__((used, section(".text.patch_utf16_to_utf8")))
 static int patch_utf16_to_utf8(const u16 *utf16_in, u8 *utf8_output)
 {
     u16 utf16_char = *utf16_in;
@@ -653,10 +656,12 @@ static int patch_utf16_to_utf8(const u16 *utf16_in, u8 *utf8_output)
     return (utf8_len << 16) | 2;
 }
 
-// static void patch_utf16_to_utf8_end(void) {}
+// 函数体结束标签：尺寸 = patch_utf16_to_utf8_end − patch_utf16_to_utf8（自动，构建期守卫校验）
+__asm__(".section .text.patch_utf16_to_utf8,\"ax\",@progbits\n\t.global patch_utf16_to_utf8_end\npatch_utf16_to_utf8_end:\n\t.previous");
 }
 
 extern "C" {
+__attribute__((used, section(".text.patch_is_oem_mb_char")))
 static int patch_is_oem_mb_char(u8 ch, int byte_idx)
 {
     if (ch <= 0x7F) {
@@ -680,7 +685,8 @@ static int patch_is_oem_mb_char(u8 ch, int byte_idx)
     }
 }
 
-// static void patch_is_oem_mb_char_end(void) {}
+// 函数体结束标签：尺寸 = patch_is_oem_mb_char_end − patch_is_oem_mb_char（自动，构建期守卫校验）
+__asm__(".section .text.patch_is_oem_mb_char,\"ax\",@progbits\n\t.global patch_is_oem_mb_char_end\npatch_is_oem_mb_char_end:\n\t.previous");
 }
 
 extern "C" {
@@ -699,6 +705,7 @@ extern "C" {
 typedef int (*patch_uni2oem_fn)(const u16 *src, u8 *dst);
 typedef int (*patch_strncmpw_fn)(const void *a, const void *b, int n);
 
+__attribute__((used, section(".text.patch_str_unicode2oem")))
 static int patch_str_unicode2oem(char *dst_oem, const u16 *src_uni)
 {
     u8 *ctx = *(u8 **)0x710024eb50ULL;          /* PFCODE_CODE_PAGE_CONTEXT（经 GOT） */
@@ -730,6 +737,9 @@ static int patch_str_unicode2oem(char *dst_oem, const u16 *src_uni)
     *out = '\0';
     return 0;
 }
+
+// 函数体结束标签：尺寸 = patch_str_unicode2oem_end − patch_str_unicode2oem（自动，构建期守卫校验）
+__asm__(".section .text.patch_str_unicode2oem,\"ax\",@progbits\n\t.global patch_str_unicode2oem_end\npatch_str_unicode2oem_end:\n\t.previous");
 }
 
 extern "C" {
@@ -748,6 +758,7 @@ typedef struct {
     u32   rsvd;
 } FsStrDescLite;
 
+__attribute__((used, section(".text.patch_stringdesc_toupper")))
 static void patch_stringdesc_toupper(FsStrDescLite *path, short maxLen, char *dst)
 {
     if (path->encode_type != 1 /* ENCODE_OEM */) {
@@ -782,23 +793,33 @@ static void patch_stringdesc_toupper(FsStrDescLite *path, short maxLen, char *ds
         *dst = '\0';
     }
 }
+
+// 函数体结束标签：尺寸 = patch_stringdesc_toupper_end − patch_stringdesc_toupper（自动，构建期守卫校验）
+__asm__(".section .text.patch_stringdesc_toupper,\"ax\",@progbits\n\t.global patch_stringdesc_toupper_end\npatch_stringdesc_toupper_end:\n\t.previous");
 }
 
 const char *fs_codepage_patch_result = "default";
 
-/* 补丁函数体实际尺寸（字节）——由构建期守卫自动校验（make 钩子运行
- * tools/check_patch_sizes.py：#define 必须 == ELF 实测 st_size，且 ≤ 补丁位空洞）。
- * 尺寸不符 = 写入 fs 的函数被截断或污染相邻函数 → fs 崩溃/补丁失效。
- * 修改任一 patch_* 函数后重跑 make；若报 SIZE MISMATCH 可执行
- * `make update-patch-sizes` 自动回写（空洞约束见脚本内 FUNCTIONS 表，
- * 依据 Ghidra 函数边界，更换目标固件版本时必须重新推导）。
- * 已知硬约束：PATCH_SZ_STR_UNICODE2OEM ≤ 0x120（0x71000f5960 为下一函数）、
- *             PATCH_SZ_TOUPPER ≤ 0xD0（0x71000f7ce0 为下一函数）。 */
-#define PATCH_SZ_UTF8_TO_UTF16     0xEC
-#define PATCH_SZ_UTF16_TO_UTF8     0x7C
-#define PATCH_SZ_IS_OEM_MB_CHAR    0x44
-#define PATCH_SZ_STR_UNICODE2OEM   0x110
-#define PATCH_SZ_TOUPPER           0x98
+/* 补丁函数尺寸自动获取：每个 patch_* 函数放入独立 .text.<函数名> section，
+ * 函数体后紧跟 <函数名>_end 汇编标签，尺寸 = 标签地址 − 函数地址
+ * （同 section 内的链接期常量距离），不再手工维护 PATCH_SZ_* 宏。
+ * 构建期守卫 tools/check_patch_sizes.py（make 钩子自动运行）校验：
+ *   1) _end 标签地址 − 函数地址 == ELF 符号表 st_size（防标签错位/函数被延迟发射）；
+ *   2) 尺寸 ≤ 补丁位空洞（脚本 FUNCTIONS 表，Ghidra 函数边界推导，
+ *      换目标固件版本时必须重新推导）。
+ * 已知硬约束：patch_str_unicode2oem ≤ 0x120（0x71000f5960 为下一函数）、
+ *             patch_stringdesc_toupper ≤ 0xD0（0x71000f7ce0 为下一函数）。 */
+template <typename T>
+static size_t patch_code_size(T start, const void *end)
+{
+    return (size_t)((uintptr_t)end - (uintptr_t)(const void *)start);
+}
+
+extern "C" const u8 patch_utf8_to_utf16_end[];
+extern "C" const u8 patch_utf16_to_utf8_end[];
+extern "C" const u8 patch_is_oem_mb_char_end[];
+extern "C" const u8 patch_str_unicode2oem_end[];
+extern "C" const u8 patch_stringdesc_toupper_end[];
 
 static char tmp_buffer[256] = {0};
 u64 tmp_addr = 0;
@@ -911,7 +932,7 @@ void fs_codepage_patch(void)
                     0x0a, 0x00, 0x40, 0x79, 0x5f, 0xfd, 0x01, 0x71, 0xc8, 0x00, 0x00, 0x54, 0x2a, 0x00, 0x00, 0x39
                 };
                 ret = fs_patch_function(handle, mem_info.addr + 0xfec30, exfat_PFCODE_CP932_Unicode2OEM, sizeof(exfat_PFCODE_CP932_Unicode2OEM),
-                    (void *)patch_utf16_to_utf8, PATCH_SZ_UTF16_TO_UTF8);
+                    (void *)patch_utf16_to_utf8, (int)patch_code_size(patch_utf16_to_utf8, patch_utf16_to_utf8_end));
                 if (ret != 0) {
                     fs_codepage_patch_result = "patch_utf16_to_utf8 failed";
                     break;
@@ -922,7 +943,7 @@ void fs_codepage_patch(void)
                     0x08, 0x00, 0xc0, 0x39, 0x0a, 0x1d, 0x00, 0x12, 0xa8, 0x00, 0xf8, 0x37, 0x20, 0x00, 0x80, 0x52
                 };
                 ret = fs_patch_function(handle, mem_info.addr + 0xfeac0, exfat_PFCODE_CP932_OEM2Unicode, sizeof(exfat_PFCODE_CP932_OEM2Unicode),
-                    (void *)patch_utf8_to_utf16, PATCH_SZ_UTF8_TO_UTF16);
+                    (void *)patch_utf8_to_utf16, (int)patch_code_size(patch_utf8_to_utf16, patch_utf8_to_utf16_end));
                 if (ret != 0) {
                     fs_codepage_patch_result = "patch_utf8_to_utf16 failed";
                     break;
@@ -933,7 +954,7 @@ void fs_codepage_patch(void)
                     0x08, 0x00, 0x01, 0x51, 0x49, 0x00, 0x80, 0x12, 0x3f, 0x81, 0x20, 0x6b, 0x08, 0x1d, 0x00, 0x12
                 };
                 ret = fs_patch_function(handle, mem_info.addr + 0xfee40, exfat_PFCODE_CP932_isOEMMBchar, sizeof(exfat_PFCODE_CP932_isOEMMBchar),
-                    (void *)patch_is_oem_mb_char, PATCH_SZ_IS_OEM_MB_CHAR);
+                    (void *)patch_is_oem_mb_char, (int)patch_code_size(patch_is_oem_mb_char, patch_is_oem_mb_char_end));
                 if (ret != 0) {
                     fs_codepage_patch_result = "patch_is_oem_mb_char failed";
                     break;
@@ -1067,7 +1088,7 @@ void fs_codepage_patch(void)
                     0xF7, 0x13, 0x00, 0xF9, 0xF6, 0x57, 0x03, 0xA9
                 };
                 ret = fs_patch_function(handle, mem_info.addr + 0xf5840, exfat_Str_Unicode2OEM, sizeof(exfat_Str_Unicode2OEM),
-                    (void *)patch_str_unicode2oem, PATCH_SZ_STR_UNICODE2OEM);
+                    (void *)patch_str_unicode2oem, (int)patch_code_size(patch_str_unicode2oem, patch_str_unicode2oem_end));
                 if (ret != 0) {
                     fs_codepage_patch_result = "patch_str_unicode2oem failed";
                     break;
@@ -1081,7 +1102,7 @@ void fs_codepage_patch(void)
                     0xF4, 0x4F, 0x02, 0xA9, 0xFD, 0x03, 0x00, 0x91
                 };
                 ret = fs_patch_function(handle, mem_info.addr + 0xf7c10, exfat_StringDesc_ToUpper, sizeof(exfat_StringDesc_ToUpper),
-                    (void *)patch_stringdesc_toupper, PATCH_SZ_TOUPPER);
+                    (void *)patch_stringdesc_toupper, (int)patch_code_size(patch_stringdesc_toupper, patch_stringdesc_toupper_end));
                 if (ret != 0) {
                     fs_codepage_patch_result = "patch_stringdesc_toupper failed";
                     break;

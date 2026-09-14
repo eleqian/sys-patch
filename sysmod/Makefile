@@ -10,29 +10,6 @@ TOPDIR ?= $(CURDIR)
 include $(DEVKITPRO)/libnx/switch_rules
 
 #---------------------------------------------------------------------------------
-# build-time guard: verify every fs codepage patch function size in the linked
-# ELF matches its PATCH_SZ_* #define in src/main.cpp and fits the hole at its
-# patch site in the fs binary. See sysmod/tools/check_patch_sizes.py.
-# Skipped with a warning if no python is available (e.g. minimal CI images).
-#---------------------------------------------------------------------------------
-PATCHCHECK_PY := $(shell command -v python3 2>/dev/null || command -v python 2>/dev/null)
-
-.PHONY: check-patch-sizes update-patch-sizes
-check-patch-sizes:
-ifdef PATCHCHECK_PY
-	@$(PATCHCHECK_PY) tools/check_patch_sizes.py $(CURDIR)/$(TARGET).elf $(CURDIR)/src/main.cpp
-else
-	@echo "warning: python not found, skipping patch size check"
-endif
-
-update-patch-sizes:
-ifdef PATCHCHECK_PY
-	@$(PATCHCHECK_PY) tools/check_patch_sizes.py $(CURDIR)/$(TARGET).elf $(CURDIR)/src/main.cpp --update
-else
-	@echo "warning: python not found"
-endif
-
-#---------------------------------------------------------------------------------
 # TARGET is the name of the output
 # BUILD is the directory where object files & intermediate files will be placed
 # SOURCES is a list of directories containing source code
@@ -79,6 +56,10 @@ CFLAGS	:=	-g -Wall -O2 -ffunction-sections \
 CFLAGS	+=	$(INCLUDE) -D__SWITCH__
 
 CXXFLAGS	:= $(CFLAGS) -std=c++23 -fno-rtti -fno-exceptions
+# -fno-toplevel-reorder: keep top-level asm (patch function _end labels) in
+# source order, otherwise GCC emits them before the deferred function bodies
+# and patch_code_size() would compute 0. See tools/check_patch_sizes.py.
+CXXFLAGS	+=	-fno-toplevel-reorder
 
 ASFLAGS	:=	-g $(ARCH)
 LDFLAGS	=	-specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)
@@ -212,6 +193,25 @@ dist: all
 
 	@rm -f sys-patch-sysmodule.zip
 	@cd out; zip -r ../sys-patch-sysmodule.zip ./*; cd ../
+
+#---------------------------------------------------------------------------------
+# build-time guard: verify every fs codepage patch function's runtime size
+# (end-label delta) equals its ELF symbol size and fits the hole at its patch
+# site in the fs binary. See tools/check_patch_sizes.py. Also run automatically
+# after every build via the $(BUILD) recipe. Skipped with a warning when no
+# python is available (e.g. minimal CI images).
+# NOTE: defined at the end of the outer makefile section on purpose -- being
+# the first target would make it the default goal and skip compilation.
+#---------------------------------------------------------------------------------
+PATCHCHECK_PY := $(shell command -v python3 2>/dev/null || command -v python 2>/dev/null)
+
+.PHONY: check-patch-sizes
+check-patch-sizes:
+ifdef PATCHCHECK_PY
+	@$(PATCHCHECK_PY) tools/check_patch_sizes.py $(CURDIR)/$(TARGET).elf
+else
+	@echo "warning: python not found, skipping patch size check"
+endif
 #---------------------------------------------------------------------------------
 else
 .PHONY:	all

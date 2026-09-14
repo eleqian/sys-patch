@@ -50,19 +50,12 @@ $(TARGETS):
 #---------------------------------------------------------------------------------
 PYTHON := $(shell command -v python3 2>/dev/null || command -v python 2>/dev/null)
 
-.PHONY: check-patch-sizes update-patch-sizes
+.PHONY: check-patch-sizes
 check-patch-sizes:
 ifdef PYTHON
-	@$(PYTHON) sysmod/tools/check_patch_sizes.py sysmod/sys-patch.elf sysmod/src/main.cpp
+	@$(PYTHON) sysmod/tools/check_patch_sizes.py sysmod/sys-patch.elf
 else
 	@echo "warning: python not found, skipping patch size check"
-endif
-
-update-patch-sizes:
-ifdef PYTHON
-	@$(PYTHON) sysmod/tools/check_patch_sizes.py sysmod/sys-patch.elf sysmod/src/main.cpp --update
-else
-	@echo "warning: python not found"
 endif
 
 clean:
