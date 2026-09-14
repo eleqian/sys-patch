@@ -44,6 +44,27 @@ all: $(TARGETS)
 $(TARGETS):
 	@$(MAKE) -C $@
 
+#---------------------------------------------------------------------------------
+# fs codepage patch size guard (runs automatically during `make` via sysmod;
+# these targets expose it directly, no DEVKITPRO needed, but build the ELF first)
+#---------------------------------------------------------------------------------
+PYTHON := $(shell command -v python3 2>/dev/null || command -v python 2>/dev/null)
+
+.PHONY: check-patch-sizes update-patch-sizes
+check-patch-sizes:
+ifdef PYTHON
+	@$(PYTHON) sysmod/tools/check_patch_sizes.py sysmod/sys-patch.elf sysmod/src/main.cpp
+else
+	@echo "warning: python not found, skipping patch size check"
+endif
+
+update-patch-sizes:
+ifdef PYTHON
+	@$(PYTHON) sysmod/tools/check_patch_sizes.py sysmod/sys-patch.elf sysmod/src/main.cpp --update
+else
+	@echo "warning: python not found"
+endif
+
 clean:
 	@rm -rf out
 	@rm -f sys-patch.zip

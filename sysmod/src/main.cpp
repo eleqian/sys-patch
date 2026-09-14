@@ -786,11 +786,14 @@ static void patch_stringdesc_toupper(FsStrDescLite *path, short maxLen, char *ds
 
 const char *fs_codepage_patch_result = "default";
 
-/* 补丁函数体实际尺寸（字节）——必须与编译产物精确一致（用
- * aarch64-none-elf-nm -S 测量），改动任一 patch_* 函数后必须复核：
- * 过小会把函数截断在指令中间（fs 崩溃），过大则会把相邻 sysmod 代码写入 fs。
- * 约束：PATCH_SZ_STR_UNICODE2OEM ≤ 0x120（0x71000f5960 为下一函数，实测 0x110）、
- *       PATCH_SZ_TOUPPER ≤ 0xD0（0x71000f7ce0 为下一函数，实测 0x98）。 */
+/* 补丁函数体实际尺寸（字节）——由构建期守卫自动校验（make 钩子运行
+ * tools/check_patch_sizes.py：#define 必须 == ELF 实测 st_size，且 ≤ 补丁位空洞）。
+ * 尺寸不符 = 写入 fs 的函数被截断或污染相邻函数 → fs 崩溃/补丁失效。
+ * 修改任一 patch_* 函数后重跑 make；若报 SIZE MISMATCH 可执行
+ * `make update-patch-sizes` 自动回写（空洞约束见脚本内 FUNCTIONS 表，
+ * 依据 Ghidra 函数边界，更换目标固件版本时必须重新推导）。
+ * 已知硬约束：PATCH_SZ_STR_UNICODE2OEM ≤ 0x120（0x71000f5960 为下一函数）、
+ *             PATCH_SZ_TOUPPER ≤ 0xD0（0x71000f7ce0 为下一函数）。 */
 #define PATCH_SZ_UTF8_TO_UTF16     0xEC
 #define PATCH_SZ_UTF16_TO_UTF8     0x7C
 #define PATCH_SZ_IS_OEM_MB_CHAR    0x44

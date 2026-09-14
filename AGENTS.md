@@ -7,6 +7,7 @@ Fork of `impeeza/sys-patch` (private remote `eleqian/sys-patch`). Main fork addi
 ## Build
 - Prereqs: devkitPro with `DEVKITPRO` set, and the libtesla submodule (`git submodule update --init --recursive`).
 - Build from the **repo root**: `make` (builds `sysmod` + `overlay`, copies into `out/`); `make dist` also zips; `make clean`.
+- After each sysmod build, `make` runs `sysmod/tools/check_patch_sizes.py` (build-time guard): every `PATCH_SZ_*` #define in `main.cpp` must equal the actual function size in the ELF **and** fit the hole at its fs patch site. `make update-patch-sizes` rewrites the defines from measured sizes; `make check-patch-sizes` checks without modifying. Hole data in the script's `FUNCTIONS` table is derived from Ghidra function boundaries — re-derive when targeting a different fs binary.
 - Do **not** run `make -C sysmod` / `make -C overlay` directly. The root Makefile exports `CUSTOM_DEFINES` / `VERSION_WITH_HASH` / build-date defines that the sub-Makefiles require.
 - Release version is `export VERSION := 1.5.9` in the root Makefile.
 - No tests, lint, or typecheck. Verify by building and checking `/config/sys-patch/log.ini` on device.

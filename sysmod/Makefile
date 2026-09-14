@@ -10,6 +10,29 @@ TOPDIR ?= $(CURDIR)
 include $(DEVKITPRO)/libnx/switch_rules
 
 #---------------------------------------------------------------------------------
+# build-time guard: verify every fs codepage patch function size in the linked
+# ELF matches its PATCH_SZ_* #define in src/main.cpp and fits the hole at its
+# patch site in the fs binary. See sysmod/tools/check_patch_sizes.py.
+# Skipped with a warning if no python is available (e.g. minimal CI images).
+#---------------------------------------------------------------------------------
+PATCHCHECK_PY := $(shell command -v python3 2>/dev/null || command -v python 2>/dev/null)
+
+.PHONY: check-patch-sizes update-patch-sizes
+check-patch-sizes:
+ifdef PATCHCHECK_PY
+	@$(PATCHCHECK_PY) tools/check_patch_sizes.py $(CURDIR)/$(TARGET).elf $(CURDIR)/src/main.cpp
+else
+	@echo "warning: python not found, skipping patch size check"
+endif
+
+update-patch-sizes:
+ifdef PATCHCHECK_PY
+	@$(PATCHCHECK_PY) tools/check_patch_sizes.py $(CURDIR)/$(TARGET).elf $(CURDIR)/src/main.cpp --update
+else
+	@echo "warning: python not found"
+endif
+
+#---------------------------------------------------------------------------------
 # TARGET is the name of the output
 # BUILD is the directory where object files & intermediate files will be placed
 # SOURCES is a list of directories containing source code
@@ -164,6 +187,7 @@ all: $(BUILD)
 $(BUILD):
 	@[ -d $@ ] || mkdir -p $@
 	@$(MAKE) --no-print-directory -C $(BUILD) -f $(CURDIR)/Makefile
+	@if [ -n "$(PATCHCHECK_PY)" ]; then $(MAKE) --no-print-directory check-patch-sizes || exit 1; else echo "warning: python not found, skipping patch size check"; fi
 
 	@rm -rf out/
 	@mkdir -p out/atmosphere/contents/420000000000000B/flags
