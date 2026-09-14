@@ -334,7 +334,17 @@ typedef struct FsDrvObject {
     u32  dwF_0x15c;                        /* 0x15c */
     u32  dwTransaction_id;                 /* 0x160 transaction op id (0x12 mount, 0x34 config) */
     u32  dwTransaction_result;             /* 0x164 result of the last transaction */
-    u8   _reserved0x168[0x60];             /* 0x168 */
+    u8   _reserved0x168[0x38];             /* 0x168 .. 0x19f */
+    /* --- exFAT UpCase 表缓存（第十八轮: exfat_resolve_path 0x71000fb6a0 +
+     *     exfat_verify_upcase_table 0x71000fbe70 机器码验证）--- */
+    u32  dwUpcase_first_cluster;           /* 0x1a0 UpCase 表首簇 (0xffffffff=未定位) */
+    u8   _padUpcase_0x1a4[4];              /* 0x1a4 (u64 对齐间隙) */
+    u64  qUpcase_size;                     /* 0x1a8 UpCase 表 DataLength (字节) */
+    u32  dwUpcase_checksum;                /* 0x1b0 表校验和 (字节级 rotr1+byte) */
+    u8   _padUpcase_0x1b4[4];              /* 0x1b4 (指针对齐间隙) */
+    void *pUpcase_cache;                   /* 0x1b8 已映射表的内存缓存基址 */
+    u32  dwUpcase_cache_capacity;          /* 0x1c0 缓存容量 */
+    u32  dwUpcase_flags;                   /* 0x1c4 bit30=表已读入并校验通过(驻留) */
     u64  qStorage_handle_0x1c8;            /* 0x1c8 storage device handle (arg to fs_storage_*) */
     u8   reserved_0x1d0[0x48];             /* 0x1d0 .. 0x217 (72 bytes, contents unknown) */
     u8   dirCache[0x6A0];                  /* 0x218 directory cache (1696 bytes).
@@ -723,22 +733,26 @@ typedef struct {
  * (fs_log_assert_check(0x58)); vtable = file-obj group at 0x7100247478. */
 typedef struct {
     void *vptr;                            /* 0x000 */
-    u32  dwOpenFlags;                      /* 0x008 bit0=read, bit1=write, bit2=append/extend */
-    u32  f_0x0c;
+    u32  dwOpenFlags;                      /* 0x008 bit0=read, bit1=write, bit2=allow-extend
+                                            *      (write: bit2=0 时 offset+size>filesize→0x307202;
+                                            *       truncate: bit2=0 才 fsetclstlink 重置簇链) */
+    u32  f_0x0c;                           /* 0x0c fopen 构造不写；全 7 方法均未访问，确认保留 */
     void *hFatHandle;                      /* 0x010 FAT handle (FS_fread/fsetpos/fflush/...) */
     void *pLogCtx;                         /* 0x018 */
     u32  f_0x20;                           /* 0x020 string slot (fs_string_cleanup(this+0x20)) */
     u32  dwModeCopy_0x24;                  /* 0x024 from IDirectoryObj.dwModeCopy */
     void *pDirSubObj;                      /* 0x028 IDirectoryObj+0x20 (ioctl target vtable+0x38) */
     void *pFatWrapper;                     /* 0x030 */
-    u8   bFlag_0x38;                       /* 0x038 enables TLS dir-read result tracking */
-    u8   f_0x39;
+    u8   bFlag_0x38;                       /* 0x038 = IDirectoryObj+0x65 (fopen 拷入),
+                                            *      enables TLS dir-read result tracking */
+    u8   f_0x39;                           /* 0x39-0x3f fopen 构造不写；全 7 方法均未访问，确认保留 */
     u8   f_0x3a;
     u8   f_0x3b;
     u32  f_0x3c;
-    void *pFatCtx;                         /* 0x040 */
-    u8   bDriveLetter_0x48;                /* 0x048 drive letter char */
-    u32  f_0x49;
+    void *pFatCtx;                         /* 0x040 = &IDirectoryObj.pFatCtx (存指针的地址,
+                                            *      供 fs_dispatch_method_cmd 上下文列表) */
+    u8   bDriveLetter_0x48;                /* 0x048 drive letter char (dtor/close 派发用) */
+    u32  f_0x49;                           /* 0x49-0x4f fopen 构造不写；全 7 方法均未访问，确认保留 */
     u8   f_0x4d;
     u8   f_0x4e;
     u8   f_0x4f;
@@ -862,6 +876,12 @@ FS_ASSERT_OFF(FsDrvObject, qLock_0x128,                 0x128);
 FS_ASSERT_OFF(FsDrvObject, wVolume_state_0x140,         0x140);
 FS_ASSERT_OFF(FsDrvObject, dwTransaction_id,            0x160);
 FS_ASSERT_OFF(FsDrvObject, dwTransaction_result,        0x164);
+FS_ASSERT_OFF(FsDrvObject, dwUpcase_first_cluster,      0x1a0);
+FS_ASSERT_OFF(FsDrvObject, qUpcase_size,                0x1a8);
+FS_ASSERT_OFF(FsDrvObject, dwUpcase_checksum,           0x1b0);
+FS_ASSERT_OFF(FsDrvObject, pUpcase_cache,               0x1b8);
+FS_ASSERT_OFF(FsDrvObject, dwUpcase_cache_capacity,     0x1c0);
+FS_ASSERT_OFF(FsDrvObject, dwUpcase_flags,              0x1c4);
 FS_ASSERT_OFF(FsDrvObject, qStorage_handle_0x1c8,       0x1c8);
 FS_ASSERT_OFF(FsDrvObject, dirCache,                    0x218);
 
@@ -1029,7 +1049,12 @@ typedef struct FatDirSearchObject {
  *   u32@0x24=FAT 数, checksum u32@0x1fc (fs_temp_clear_and_restore)。
  * 日志(写前备份)记录 0x20 字节×2 镜像: magic@0, u32@0x10=槽号游标, @0x14=错误码,
  *   @0x18=起始扇区, @0x1c=扇区数。
- * 9 槽日志表 aSlotStart/aSlotCount 记录已备份的 {起始扇区,扇区数} 区间。
+ * 9 槽日志表 aSlotStart/aSlotCount 记录已备份的 {起始扇区,扇区数} 区间;
+ *   每槽占扇区数 = count+1 (1 条 0x20 日志记录 + count 扇区备份数据), 依次排在
+ *   头扇区后 +2 起; 记录双镜像 (原位置 + count*bps + 0x20 处各一份)。
+ * 工作缓冲 (init 分配一次) 布局: [0, 0x20 扇) 扇区缓冲(+0x88) → 日志缓冲(+0x78,
+ *   容量 FAT 扇区数+1) → 位图(+0x20, 字节数 +0x28, bit=日志扇区占用)。
+ * 回放键: key1 = 槽游标 ctx+0x18, key2 = 最近错误码 ctx+0x14 (op0xc 匹配用)。
  * 经介质驱动表 G (fs_fatdrv_manage_recovery_slot / fs_fatdrv_recovery_dispatch)
  * 间接调用; fat_prf2safe_recovery_operation_dispatch (0x7100113680) 为 15 操作码总派发。 */
 typedef struct Prf2SafeCtx {
@@ -1040,29 +1065,34 @@ typedef struct Prf2SafeCtx {
     u32  dwFlags_0x10;                     /* 0x10 bit0=已初始化 (v1 拒绝重复初始化) */
     u32  dwLastErrorCode_0x14;             /* 0x14 初始化传入的错误码 (拒 0x13/0x1d/0x6a/0x34&0x0A) */
     u32  dwSlotIndexCursor_0x18;           /* 0x18 槽号游标 (get_next_slot_index = +1) */
-    u32  dwF_0x1c;                         /* 0x1c */
+    u32  dwF_0x1c;                         /* 0x1c 日志活动/重入标志 (非 0 时 IO 直通不写日志) */
     void *pBitmapBuf_0x20;                 /* 0x20 簇位图缓冲 (回放时置位) */
     u32  dwBitmapBufSize_0x28;             /* 0x28 */
     u32  dwReserved_0x2c;
     u32  aSlotStart_0x30[9];               /* 0x30 日志槽起始扇区 (0xffffffff=空闲) */
     u32  aSlotCount_0x54[9];               /* 0x54 日志槽扇区数 */
     void *pJournalBuf_0x78;                /* 0x78 日志缓冲 */
-    u32  dwJournalCapacity_0x80;           /* 0x80 容量(扇区) */
+    u32  dwJournalCapacity_0x80;           /* 0x80 日志容量(扇) = FAT 扇区数+1 (init 写入) */
     u32  dwReserved_0x84;
-    void *pSectorBuf_0x88;                 /* 0x88 通用扇区缓冲 */
-    u32  dwFatSectors_0x90;                /* 0x90 FAT 扇区数 */
+    void *pSectorBuf_0x88;                 /* 0x88 通用扇区缓冲 (=工作缓冲基址, 同 +0xb0) */
+    u32  dwSectorBufSectors_0x90;          /* 0x90 扇区缓冲容量(扇) = 0x20 (init 固定写入; 非旧记的 FAT 扇区数!) */
     u32  dwReserved_0x94;
     char szVolumeLabel_0x98[13];           /* 0x98 卷标/隐藏文件路径 (op0xb 写, op10 读) */
     u8   bPad_0xa5[3];
-    u32  dwF_0xa8;                         /* 0xa8 */
-    u32  dwF_0xac;                         /* 0xac */
-    u8   aReserved_0xb0[0x20];
-    u32  dwWriteSector_0xd0;               /* 0xd0 当前写入扇区 (base + (copy-2)*0xf2) */
-    u32  dwF_0xd4;                         /* 0xd4 成功置 1 */
+    u32  dwF_0xa8;                         /* 0xa8 连续性要求标志 (op3 恢复文件=1 时校验簇链连续, op0xb 写) */
+    u32  dwF_0xac;                         /* 0xac 已定位恢复头扇区 (op1 扫描起点, 0xffffffff=未定位) */
+    void *pWorkBuf_0xb0;                   /* 0xb0 工作缓冲基址 (init 分配, 同 +0x88) */
+    u32  dwWorkBufSize_0xb8;               /* 0xb8 工作缓冲总字节数 */
+    u8   aPad_0xbc_0[4];
+    void (*pfnAllocBuf_0xc0)(u8, u32, void **); /* 0xc0 缓冲分配回调 (盘符,大小,out; 缺失/重复分配→-7, 失败→-9) */
+    void (*pfnFreeBuf_0xc8)(u8, void *);   /* 0xc8 缓冲释放回调 (cleanup 调用; 缺失→-7, 失败→-10) */
+    u32  dwWriteSector_0xd0;               /* 0xd0 恢复副本基扇区 = RegionBase+(copy-2)*0xf2; 日志区在 +0x14 扇 */
+    u32  dwF_0xd4;                         /* 0xd4 成功/日志就绪标志 (格式化与回放成功路径置 1) */
     u32  dwJournalKey1_0xd8;               /* 0xd8 回放匹配键1 */
     u32  dwJournalKey2_0xdc;               /* 0xdc 回放匹配键2 */
     u8   bVersion_0xe0;                    /* 0xe0 头版本字节 */
-    u8   aReserved_0xe1[7];
+    u8   aReserved_0xe1[3];
+    u32  dwVolumeStatus_0xe4;              /* 0xe4 卷状态 (fat_get_volume_status_info_wrapper 输出) */
     u32  dwRegionEnd_0xe8;                 /* 0xe8 保护区终止扇区 */
     u32  dwFatSizeBytes_0xec;              /* 0xec FAT 字节数 */
     u16  wBytesPerSector_0xf0;             /* 0xf0 */

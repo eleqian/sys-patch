@@ -1,6 +1,7 @@
 # FS 逆向分析最终结论（19.exfat.FS.kip1，image base 0x7100000000）
 
 > 状态：FS 卷驱动结构与生命周期分析已闭环（2026-09-13 第十二轮收尾，无阻塞遗留）。
+> 第十八轮（2026-09-14）补齐 exFAT 条目处理链全环节（§8.5）：打开/搜索/创建/更新/删除/重命名 + UpCase 表缓存 + NameHash 硬门。
 > 本文档是 12 轮逆向分析的整理版，**只保留经机器码验证的正确结论**；历史草稿中的误判见 §0，不再散落在正文。
 > 结构体/偏移的权威来源是同目录 **`fs_structs.h`**（packed + `_Static_assert` 全部通过）；
 > Ghidra 数据库（FS_1/19.exfat.FS.kip1）已与头文件同步（2026-09-14 复核，含指针宽度修复）。
@@ -224,7 +225,9 @@ fs_dispatch_method_cmd 二次间接）→ 服务端操作表。共享 nop 槽 0x
 
 客户端虚表（0x7100247518）槽位：+0x00 fs_idirectory_destructor、+0x08 dtor_trace、
 +0x10 IDirectory_Read、+0x18 IDirectory_GetEntryCount、+0x30 fs_idirectory_cmd_close_dir_handle、
-+0x38 nop、+0x40 fs_safe_release_object、+0x60 fs_open_directory_callback、+0x68 nop、+0x70 thunk。
++0x38 nop、+0x40 fs_safe_release_object、+0x60 fs_open_directory_callback、+0x68 nop、
++0x70 thunk（0x71000d4f98 = 链接器 branch island：b→0x71001ca280→b→0x7100188af0，
+最终与 +0x40 同为 fs_safe_release_object；**this 调整量 = 0**，纯远距离尾跳）。
 
 ### 6.3 FsDirFileObj（0x58）与 IDirectoryObj（0x78）
 
@@ -266,16 +269,165 @@ fs_dispatch_method_cmd 二次间接）→ 服务端操作表。共享 nop 槽 0x
 | +0x70 | fs_fatdrv_alloc_cluster_range @0x7100110dc0 | fat_allocate_cluster_range |
 | +0x78 | fs_fatdrv_recovery_dispatch @0x7100110ee0 | fat_prf2safe_recovery_operation_dispatch |
 
-### 7.2 PRF2SAFE 恢复机制（介质驱动层，非 fork 补丁面）
+### 7.2 PRF2SAFE 恢复机制（介质驱动层，第十四轮深挖完整版）
 
-- `FS_isPRF2SAFE` @0x7100114b90：memcmp "PRF2SAFE" 8 字节。
-- 恢复区头 = 2 个镜像 0x200 扇区：magic@0、ver@0x10=100/@0x11=0x65、u32@0x16=槽号、
-  u32@0x20=错误码、u32@0x24=FAT 数、checksum@0x1fc。
-- **日志 = 写前备份**：0x20 字节记录 ×2 镜像 {magic, 槽号@0x10, 错误码@0x14,
-  起始扇区@0x18, 扇区数@0x1c}；9 槽日志表（Prf2SafeCtx+0x30/0x54）记录已备份区间。
-- `fat_prf2safe_recovery_operation_dispatch` @0x7100113680 = 15 操作码总派发
-  （op1 扫描校验头 / op4 写头 / op5 分配簇+格式化恢复区 / op6 文件 IO /
-  op0xc 日志回放 / op10/0xb 读写卷标等）。完整字段见 `fs_structs.h` 的 Prf2SafeCtx（0x10C）。
+`FS_isPRF2SAFE` @0x7100114b90：memcmp "PRF2SAFE" 8 字节。完整字段见 `fs_structs.h`
+的 Prf2SafeCtx（0x10C）。
+
+#### 头/日志格式
+
+- 恢复区头 = 2 个镜像 0x200 扇区（`fat_write_prf2safe_recovery_data`
+  @0x71001118c0 一次写 2 扇区，位置 = RegionBase + (copy-2)×0xf2）：
+  magic@0、ver@0x10=100(='d')/@0x11=0x65、u32@0x16=槽号、u32@0x20=错误码、
+  u32@0x24=FAT 数、CRC32@0x1fc（`fs_temp_clear_and_restore` @0x7100114c20：
+  清零字段→`fs_crc32_compute`→恢复字段，返回 CRC 值比较）。
+- **日志 = 写前备份**：0x20 字节记录 {magic@0, 槽号游标@0x10, 错误码@0x14,
+  起始扇区@0x18, 扇区数@0x1c}，双镜像（原位 + count×bps + 0x20 处）；
+  每槽占 count+1 扇区（1 记录 + count 扇区备份数据），依次排在头扇区 +2 起；
+  9 槽日志表 aSlotStart/aSlotCount（ctx+0x30/0x54）记录已备份区间。
+
+#### 操作码总派发 `fat_prf2safe_recovery_operation_dispatch` @0x7100113680（op 越界→-11）
+
+| op | 功能 |
+|----|------|
+| 1 | 扫描恢复头：0xac==0xffffffff 时从扇区 1 起逐扇区读（全零扇区跳过）；命中后校验 CRC@0x1fc、版本字节（0x10=='d' 且 0x11<0x66）、错误码@0x20∈(1,RegionEnd)、FAT 数@0x24 == ceil(FatSizeBytes/(bps×8))+0x15。有效→{扇区,1,错误码,FAT 数}；存在但无效→{扇区,2,-1,0}。 |
+| 2 | 读第 N 份 FAT 副本头（扇区 = RegionBase+(N-2)×0xf2，主/备镜像 ±1）：校验 magic+CRC+版本 → ctx+0xe0=版本；输出 pArgs[4]=镜像号(1/2)、[5]=错误码@0x20、[6]=槽号@0x16。 |
+| 3 | 打开恢复隐藏文件：路径 = 盘符 + `":\"` + ctx+0x98 卷标（13 字节），模式 **"r"**（串@0x71001cd07e）；校验文件大小 == pArgs[3]×bps 且起始簇 == pArgs[2]；ctx+0xa8==1 时额外 `fat_check_cluster_chain_contiguous`（@0x7100114790，读 FAT 项批量校验相邻 +1，允许尾项 0xFFFFFFFF）。pArgs[7]=1 通过 / 2 不符。 |
+| 4 | 写全新头扇区：目标 0xffffffff 时从 0xac（否则扇区 1）找全零扇区；填 {magic,100@0x10,0x65@0x11,错误码@0x20,FAT 数@0x24,CRC@0x1fc} 单扇区写+verify（`fat_prf2safe_verify_data_operation` @0x7100114900 = `fs_data_operation_check_v2` 写模式 2）。 |
+| 5 | 分配空闲簇范围并格式化恢复区：每副本需 ceil(FAT扇区数)+0x15 扇区、按 bSectorsPerFatCopy(0xf2) 归整后 ×2 簇；`fat_find_free_clusters_range_wrapper` 搜索，命中后 `fat_write_prf2safe_and_verify`（@0x71001145a0，见下）。输出 pArgs[2]=起始簇、[3]=扇区数。 |
+| 6 | 恢复文件 IO：同 op3 路径，模式 **"w"**（串@0x71001cd394）；按 pArgs[2] 扇区号 ×bps 字节读出比对（`fat_file_io_operation_by_path` @0x7100111f30）。 |
+| 7 | 直接 `fat_write_prf2safe_and_verify(ctx, pArgs[2]副本号)`。 |
+| 8/0xf | 读/写 ctx+0x04 状态（op8 输出）。pArgs null → -7。 |
+| 9 | `fat_device_state_machine` @0x7100111060：状态 0-4 迁移（2→ioctl(0x104,0x108)；3→查询/设 flags 后 ioctl(0,0)+type0，失败回滚 flags；4→type2 ioctl），写回 ctx+0x04。 |
+| 10 | 读卷标（13 字节→pArgs）+ ctx+0xa8/0xac（→pArgs[4]/[5]）。 |
+| 0xb | 写卷标（strnlen<0xd）+ 0xa8/0xac（来自指针参数，可 null 跳过）。 |
+| 0xc | **日志回放**（最复杂，见下）。 |
+| 0xd | `fat_device_check_operation_type2` @0x71001152b0。 |
+| 0xe | 写 ctx+0x08 设备状态（限 <2）。 |
+
+#### op0xc 日志回放（pArgs[2]=副本槽, [4]=错误码→0xd4, [5]/[6]=回放键2/1→0xdc/0xd8）
+
+1. 定位日志区 = dwWriteSector(0xd0)+0x14 扇区，读入 pJournalBuf(0x78)；
+   清空簇位图 pBitmapBuf(0x20)。
+2. 链式遍历日志记录：每条记录 {key1@8, key2@0xc, 副本槽@0x10, 数据扇区数@0x18}，
+   占 (count+1) 扇区；key1/key2 与 ctx+0xd8/0xdc 不符即停。
+   命中记录：把备份数据（原 0x20 字节头 @槽×bps，原数据 @（槽+count)×bps+0x20）
+   写回原扇区（`fs_validate_write_bounds`），并在位图中按 槽>>2..（槽+count-1)>>2
+   置位（4 扇区/位）；随后清零日志内备份副本与镜像。
+3. 记录链耗尽后走 FAT 备份扇区二次恢复：从副本 +2 起逐段校验
+   {key1@0x10, key2@0x14, count@0x1c} 的记录，最多 0x11（17）轮，
+   将 0x20 字节块按 @0x18 扇区写回。
+4. 中途日志满（剩余 0）时：`fs_ioctl_wrapper(h,0,0)` →
+   `fat_cluster_alloc_free_operation` @0x7100111b70 → ioctl(0x104,0x108) 重新扩容。
+5. 全部成功后 `fat_write_prf2safe_recovery_data(h,ctx,0,0)` 重写全新头
+   （槽 0/错误码 0），清 key1/key2，0xd4=1；任一步失败原样返回（-21 读失败 / -22 写失败）。
+
+#### 初始化与槽管理
+
+- `fat_init_prf2safe_recovery_v1` @0x71001117c0：重复初始化→-13；错误码∈
+  {0x13,0x1d,0x6a} 或 (0x34 且设备 flags&0x0A)→-15（这些错误不建恢复点）；
+  槽游标 = 旧游标+1（`fat_prf2safe_get_next_slot_index` @0x7100114b80），
+  写头（`fat_write_prf2safe_recovery_data`），清位图，日志 9 槽表
+  交替填 {0xffffffff,0}，置 flags bit0=1。
+- `fat_prf2safe_manage_recovery_slot` @0x7100112bc0（G 槽 +0x68）：入参
+  {起始扇区,扇区数}，范围须在 [RegionBase, RegionBase+RegionEnd×0xf2) 内且
+  count<FAT扇区数；与 9 槽表逐一求交：已完全覆盖→0（不重复备份），部分重叠
+  则裁剪（记录仍要写的剩余区间），跨越多槽尾部越界→-2；新槽追加在首个空闲
+  槽位（9 槽满→-2），扇区偏移 = 0xd0 + 2 + Σ(前槽 count+1)，写记录+镜像
+  （count+1 扇区）并登记槽表。
+
+### 7.3 FAT 驱动核心层（G 表其余槽 callee，第十五轮）
+
+#### 设备表（全局静态 @0x7100fdb7b0）
+
+- 5 槽设备指针表 0x7100fdb7c0/0xc8/0xd0/0xd8/0xe0，计数 +0xb8，
+  惰性初始化标志 +0xb0（首次访问清零全部）。
+- `fat_register_device_slot` @0x71001112a0（G+0x00 核心）：设备对象状态
+  （+0x04）∈{0,2,4}（掩码 0x15）否则 -1；写状态=1 后入表；已在表→-4，
+  表满→-5，成功 count+1。
+- `fat_unregister_device_slot` @0x7100111460（G+0x08 核心）：状态清 0，
+  ioctl 检查（参数 1），不在表→-6；清槽 count-1。
+
+#### 挂载初始化 `fat_init_fat_data_structures` @0x7100111530（G+0x10 首挂载路）
+
+1. `fat_get_volume_status_info_wrapper(hDrv, ctx+0xe4)` → 卷状态；
+   `fat_device_query_info_operation(hDrv, &ctx+0x104, &ctx+0x108)` →
+   缓存 ioctl 参数（供状态机 3/日志扩容复用）。
+2. `fat_check_fat_type_and_state(ctx)` != 1 → 出参=2（类型/状态不符）。
+3. FAT 扇区数 = ceil(FatSizeBytes/(bps×8))；位图字节 = 对齐(ceil(扇区/32)×4)；
+   工作缓冲总大小 = 位图字节 + (FAT扇区+1)×bps。
+4. 经 ctx+0xc0 分配回调（盘符, 大小, &ptr）分配；无回调/重复分配→-7，
+   分配失败→-9（回调来自注册时的设备描述，驱动提供）。
+5. **工作缓冲布局**（基址同时存 +0xb0 与 +0x88）：[0,0x20 扇) 扇区缓冲
+   （容量 0x20 → +0x90）→ 日志缓冲（+0x78，容量 FAT扇区+1 → +0x80）→
+   位图（+0x20，字节数 +0x28，u32 数 +0x2c，bit=日志扇区占用）；
+   总字节数 → +0xb8。
+6. 状态迁移（+0x04）：1→2；2 保持；3→ioctl(0x104,0x108) 后→2；
+   其余→0xffffffff。出参 1=成功。
+
+#### IO 钩子 `fat_dispatch_io_operation` @0x7100111a60（G+0x28 核心）
+
+- 请求类型（param_3+4）∈{0x11, 0x1000} 或 ctx+0x1c≠0（回放中）→ 直通 0。
+- 否则按 ctx+0x14（最近错误码）分流：==0x12 → 以当前副本号
+  （(0xd0-0x100)/0xf2+2）+ FAT扇区+0x15 扇区重写恢复文件
+  （`fat_file_io_operation_by_path`）；其余 → `fat_cluster_alloc_free_operation`
+  （日志刷盘）。
+- 失败且错误码 ∉ {-21,-22,-26} → 清错误码、重写全新头（slot 0/err 0）；
+  重写再失败（<-22）→ 清 flags bit0（去初始化，下次重新 init）。
+- **结论：介质层把写前备份/恢复挂在了所有 IO 的公共路径上**，
+  0x11/0x1000 是绕过日志的内部命令。
+
+#### 日志刷盘 `fat_cluster_alloc_free_operation` @0x7100111b70
+
+遍历位图置位段（上限 = 日志容量-1）：把日志缓冲中段内数据经扇区缓冲
+（分块 ≤0x20 扇）写入磁盘 `总扇区(+0xf8) + FAT字节(+0xec) + 扇区号`
+（恢复区数据带），先写后读回校验；段号必须递增（乱序→-2），
+IO 失败→-21/-22。op0xc 日志满扩容后也调用它。
+
+#### 位图/簇范围（G+0x40/0x48/0x50/0x70）
+
+- `fat_bitmap_find_free_region` @0x7100112640（+0x40 核心）：在位图上
+  （位↔扇区，范围 [总扇区数, 总扇区数+FAT字节)）自入参起点找 count 长
+  连续置位区间，就地输出实际 {起始,数量}；越界/未找到→-2。
+- `fat_allocate_cluster_range` @0x7100113240（+0x70 核心）：在入参簇范围上
+  循环 `fat_allocate_clusters_wrapper` 分配并拼连续链（逐项校验相邻），
+  越界检查 RegionEnd+2，`fat_verify_and_write_fat_entries` 写 FAT 项，
+  成功后 `fat_free_cluster_chain_wrapper` 释放旧链（范围重分配模式）；
+  输出 {数量,起始簇,末簇,起始块}。位图标记/查找两槽（+0x48/+0x50）
+  为同族包装。
+
+#### 卸载清理与位图两槽（第十六轮补齐）
+
+- `fat_cleanup_fat_data_structures` @0x71001116e0（+0x18 核心）：ioctl(+0x104,
+  +0x108) 后经 **ctx+0xc8 释放回调**（与 +0xc0 分配回调成对）释放工作缓冲
+  （+0xb0），清 0xb0/b8/88/90/78/80；状态∈{0,2,4}→回 1。无缓冲/回调→-7，
+  释放失败→-10。
+- `fat_bitmap_mark_region_used` @0x7100112800（+0x48 核心）：{绝对扇区,数量}
+  →FAT 区相对位图，日志缓冲（+0x78）逐位 OR 置位 + 日志占用位图（+0x20）
+  按簇粒度置位；输出 {FAT字节+扇区,数量}，越界→-2。
+- `fat_bitmap_find_used_region` @0x71001129b0（+0x50 核心）：与 +0x40 同族
+  扫描，但按 {起始[0],上界[1],上次结果[2][3]} 续扫首个连续**已用**段，
+  输出 [4]/[5]；未命中回显输入区间。
+- 标志位三槽（+0x30/+0x58/+0x60）包装守卫一致：设备 state==3（已挂载）+
+  设备+0x10 bit0（媒体就绪）+ 设备+0x14 错误码≠0x12，核心
+  `fat_set/clear_flag_bit1/bit2` 操作 ctx flags bit1/bit2，失败记设备+0x1c。
+  设备对象布局再证：+0=0xAABBCDDD、+0x04=状态、+0x14=错误码、+0x1c=最近错误。
+- **G 表 16 槽全部有结论**（位图标记/查找仅行为级）。
+- 本轮已同步 Ghidra：Prf2SafeCtx 重建（0x10C，+0x90 改名
+  dwSectorBufSectors_0x90、新增 0xb0/0xb8/0xc0/0xc8/0xe4、
+  0x1c/0xa8/0xac/0xd4 语义化更名）、12 处 plate 注释，
+  已 save_all_programs。
+
+#### 日志压缩 `fat_compact_directory_entries` @0x7100112140（G+0x38 核心，名不副实）
+
+- 类型∈{0x11,0x1000} 或 ctx+0x1c≠0 → 0；扫描位图找连续置位段
+  （≤9 段，总扇区 ≤ 日志容量），把每段合并为**单条大记录**
+  {magic, key1@8=槽游标(+0x18), key2@0xc=错误码(+0x14), 总扇区@0x14,
+  段起始@0x10, 段长@0x18}，双镜像写入恢复文件日志区（0xd0+0x14 起），
+  成功后清 ctx+0x10 bit2。
+- **关键佐证：op0xc 回放的 key1/key2 即 ctx+0x18（槽游标）/ctx+0x14
+  （最近错误码）**——与回放代码中 `dwJournalKey1/2_0xd8/0xdc` 完全对应。
+- 标志位槽（+0x30/0x58/0x60）为 ctx+0x10 bit1/bit2 的置/清包装（略）。
 
 ---
 
@@ -335,6 +487,53 @@ exFAT File/Stream/Name 目录项
 
 exFAT 的匹配完全在 UTF-16 域做 ⇒ 只要 OEM2Unicode 输入正确理论上应命中；
 "打不开"的残余风险来自 §9 的内存破坏与未覆盖点。
+
+### 8.5 exFAT 条目处理链（第十八轮闭环）
+
+**Stream 条目盘上布局定案**（读 `fat_copy_entry_to_fsobj_typeC0` / 写
+`exfat_build_name_entry_buffer` 0x71000fd660 双向对称验证）：
+`{0xC0@0, flags@1, rsvd@2, NameLen@3, NameHash@4, ValidDataLength(u64)@8,
+rsvd@0x10, FirstCluster@0x14, DataLength(u64)@0x18}`。
+
+FsObject 条目镜像字段：0x208 attr(u16)、0x210 DataLength、0x218–0x22b 时间戳+UTC offset、
+0x23c FirstCluster、0x244 dirCluster、0x248 entryOffset、0x24a streamFlags(Stream+1)、
+0x260 NameLength(Stream+3)、0x261 SecondaryCount(File+1)、**0x262 SetChecksum(u16, File+2)**、
+**0x264 NameHash(Stream+4)**、**0x268 ValidDataLength(u64, Stream+8)**、0x270/0x274 条目集跨簇续写游标。
+
+**打开/搜索链**：exfat_entry_lookup → exfat_prepare_entry_search（UTF-8→UTF-16 经补丁点
+PFCODE_Str_OEM2Unicode → `exfat_resolve_path`(0x71000fb6a0) 按盘上 UpCase 表逐字符大写 →
+NameHash=rotr1+char 存 +0x264；SecondaryCount=1+ceil(len/15)）→ FAT_SearchDirectory1 →
+exfat_search_directory（遍历条目）→ fat_process_directory_match：
+- 0x85 File：attr 过滤 + SecondaryCount 装载计数器；同时开始**条目集校验和**累积
+  （rotr1+byte，仅 File 条目跳过字节 2-3）；
+- 0xC0 Stream：**NameHash 硬门**——stream.NameHash != hash(大写搜索名) ⇒ 整个条目集跳过
+  （该文件不可见，而非"名字不匹配"）；
+- 0xC1 Name×N：名字片段拼入 FsObject.name（30B/条），每条累积校验和；集齐后
+  校验和 == FsObject+0x262 才进入 fat_check_name_match（条目名再大写一次+通配符，双重大写幂等）。
+
+**创建/更新/删除/重命名**：
+- 创建：prepare_entry_search(setTime=1) → FAT_SearchDirectory1(name=null 找空位) →
+  `fat_write_directory_entries`（0x85+0xC0+0xC1×N；中途失败把已写条目 type&~0x80
+  回滚=0x05/0x40/0x41）；
+- 更新（flush/write/close 调）：`exfat_write_file_entry`(0x71000fd430) →
+  `exfat_prepare_entry_data`(0x71000fd180) 重算条目集校验和 → 存 +0x262 →
+  exfat_build_file_entry_buffer(0x85, 0x71000fd380) + exfat_build_name_entry_buffer(0xC0)
+  只写两主条目（C1 不动）；
+- 删除：`exfat_delete_directory_entry`(0x71000fc720) 逐条目 type&~0x80 写回 + flush；
+- 重命名：`exfat_rename_entries`(0x710010bb00) = prepare(新名, setTime=0) + 拷贝时间戳/
+  FirstCluster/ValidDataLength + 删源 + 找空位 + 写目标（失败有对称回滚）。
+
+**UpCase 表缓存**（FsDrvObject 新字段，已入 `fs_structs.h` + Ghidra 同步）：
+0x1a0 首簇 / 0x1a8 大小 / 0x1b0 校验和 / 0x1b8 内存映射基址 / 0x1c0 容量 /
+0x1c4 bit30=已验证驻留。`exfat_verify_upcase_table`(0x71000fbe70) 整表读入并做字节级
+rotr1+byte 校验（失败 0x23）。resolve_path 查表未命中或 0xFFFF 压缩段 → 输出原字符（CJK 安全）。
+
+**补丁面结论**：exFAT 匹配/存储全程 UTF-16 域，唯一编码依赖 = OEM2Unicode 补丁点
+（prepare_entry_search / search_directory 两处调用）。NameHash 与条目集校验和均从同一
+FsObject 缓冲派生，创建与打开自洽；互操作残余风险仅无效 UTF-8 输入（R5 越界读）。
+附注："<" 开头的名字在 exfat_entry_lookup 直接返回 2；fat_check_name_match 有
+"<N>"→dwEntryIndex 匹配分支，但 NameHash 硬门下 hash("<N>") 不会等于真实名字 hash，
+"<N>" 索引打开应走枚举（ReadDirEntry）路径——若上机复现"<N>"打不开，先查这里。
 
 ---
 
@@ -436,7 +635,8 @@ exFAT 的匹配完全在 UTF-16 域做 ⇒ 只要 OEM2Unicode 输入正确理论
 | 0x71000f4f30 | `int FAT_SplitPath_Inner(void*, StringDesc*, StringDesc*, StringDesc*)` |
 | 0x71000f5460 | `void FAT_GetShortNameInner(char*, FatBaseEntry*, uint)`（恒返 0，sname 出参） |
 | 0x71000f1100 | `void FAT_GetShortNmae(FsObject*, FatBaseEntry*)` |
-| 0x710010c970 | `int exfat_search_directory_entries(FsDrvObject*, uint startCluster, byte sectorShift, ulong clusterIndex, int entryOffset, int *outIndex)`（2/3 参暂定） |
+| 0x710010c970 | `int exfat_search_directory_entries(FsDrvObject*, uint dirStartCluster, byte attrByte, u64 exfatDataLength, uint targetFatCluster, int *outChainIndex)`（第十七轮坐实：p3=init 类型字节（exFAT=fctx+0x2c8 attr，否则 1，非 sectorShift）；p4=exFAT stream DataLength（fctx+0x2d0，=dirInfo.field_0x38）；p5=目标 FAT 簇号；p6=出参链内序号，-1 未找到→0xd） |
+| 0x71000e72a0 | `int fat_find_cluster_by_index(FatFileContextPart*, uint fatClusterNo, uint *outChainIndex)`（沿目录簇链找 fatClusterNo 所在位置：逐项 fat_read_fat_entry_dispatch 直到命中，exFAT 位图路径直接 out=clusterNo-startCluster；参数名 entryIndex 为误名） |
 | 0x710010ca20 | `int exfat_entry_lookup(FsDrvObject*, FatFileContext*, StringDesc*, FsDirInfoInternal*)` |
 | 0x71000f9db0 | `fs_traverse_directory_path`（缓冲参数 = FsObject*） |
 
@@ -518,6 +718,15 @@ fs_volume_storage_operation_wrapper(0x7100115eb0)、fs_dispatch_method_cmd(0x710
 | 0x710010ca20 | exfat_entry_lookup | exFAT 打开入口 |
 | 0x71000fc8f0 | exfat_prepare_entry_search | 路径→UTF-16 + NameHash |
 | 0x71000fa7a0 | exfat_search_directory | exFAT 目录搜索 |
+| 0x71000fb6a0 | exfat_resolve_path | UpCase 表逐字符大写（第十八轮） |
+| 0x71000fbe70 | exfat_verify_upcase_table | UpCase 表读入+校验（第十八轮） |
+| 0x71000fcb10 | fat_hash_shortname | exFAT NameHash（rotr1+char）（第十八轮） |
+| 0x71000fd180 | exfat_prepare_entry_data | 构建 0x85/0xC0/0xC1 + 条目集校验和（第十八轮） |
+| 0x71000fd380 | exfat_build_file_entry_buffer | 0x85 File 条目缓冲（第十八轮） |
+| 0x71000fd430 | exfat_write_file_entry | 条目更新写（flush/write/close）（第十八轮） |
+| 0x71000fd660 | exfat_build_name_entry_buffer | 0xC0 Stream 条目缓冲（第十八轮） |
+| 0x71000fc720 | exfat_delete_directory_entry | 条目集删除（type&~0x80）（第十八轮） |
+| 0x710010bb00 | exfat_rename_entries | 重命名 = 删源+找空位+写目标（第十八轮） |
 
 ---
 
@@ -525,6 +734,10 @@ fs_volume_storage_operation_wrapper(0x7100115eb0)、fs_dispatch_method_cmd(0x710
 
 - **476 个 vptr 构造函数反查**：正式划出范围——属 nn::ro/NCA/GC 等与 fork 补丁面无关的
   子系统，且本环境 Ghidra 脚本执行被禁；与本工程相关的虚表族（0x7100247xxx 农场）已全部识别。
-- **PRF2SAFE 介质层**：厂商中间件行为，与 codepage 补丁无交集（§7 仅作记录）。
-- 可选：FsDirFileObj 服务端表之外的客户端块成员（0x71000d30d0 等）精确定名；
-  FsDirIterObj 客户端块 thunk 调整量；exfat_search_directory_entries 2/3 参语义坐实。
+- ~~**PRF2SAFE 介质层**~~：第十四轮已完整分析（§7.2）——厂商中间件行为，
+  与 codepage 补丁无交集，结论仅作记录。
+- ~~FsDirFileObj 客户端块成员 / FsDirIterObj thunk 调整量 / exfat_search_directory_entries 参数语义~~：
+  第十七轮全部关闭（§6.2/§10.3）——FsDirFileObj 由 fopen 构造路径定名完毕，
+  f_0x0c/0x39-0x3f/0x49-0x4f 经全部 7 个方法反编译确认不触碰（保留）；
+  +0x70 thunk = branch island→fs_safe_release_object（调整量 0）；
+  exfat_search_directory_entries 6 参语义坐实（目标 FAT 簇号→链内序号）。
