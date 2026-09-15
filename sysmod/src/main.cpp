@@ -664,25 +664,24 @@ extern "C" {
 __attribute__((used, section(".text.patch_is_oem_mb_char")))
 static int patch_is_oem_mb_char(u8 ch, int byte_idx)
 {
-    if (ch <= 0x7F) {
-        // 1字节UTF-8：0xxxxxxx
-        return 0;
-    } else if ((ch & 0xE0) == 0xC0) {
-        // 2字节UTF-8：110xxxxx 10xxxxxx
-        return 1;
-    } else if ((ch & 0xF0) == 0xE0) {
-        // 3字节UTF-8：1110xxxx 10xxxxxx 10xxxxxx
-        return 2;
-    } else if ((ch & 0xF8) == 0xF0) {
-        // 4字节UTF-8：11110xxx ...（对应U+10000~U+10FFFF）
-        return 3;
-    } else {
-        // 续字节/非法字节（R7）：与 patch_utf8_to_utf16 对续字节按 len=1
-        // 处理保持自洽——返回 0 使 GetNextChar 补丁点只走原有固定 +1，
-        // 避免转换器(前进1)与步进(前进2)失步。byte_idx 忽略。
-        (void)byte_idx;
-        return 0;
+    const unsigned c = ch;
+
+    /* ⚠️ 必须按 byte_idx 区分两种语义（原版 CP932 亦如此，见 0xfee40 结尾的两次 csel）：
+     *   idx=1：首字节 → 返回"后面还有几个字节"（0=单字节/ASCII），补丁点用它做步进；
+     *   idx=2：第二字节 → 只判"是否为合法尾字节"（1/0），FAT_GetNextPathComponent
+     *          用它校验多字节字符的第二个字节，cbz 即判为非法 → 直接 PathNotFound。
+     *   曾因忽略 idx、让续字节一律返回 0，导致中文名能枚举但打不开（FsError_PathNotFound）。
+     * 尺寸硬约束：≤0x50（0x71000fee40..0x71000fee90，之后是回调表引用的 stub）。 */
+    if (byte_idx != 1) {
+        return (byte_idx == 2) && ((c >> 6) == 2);   /* 10xxxxxx = UTF-8 续字节 */
     }
+    if (c < 0xC0) {
+        return 0;                                    /* ASCII 与续字节：按单字节步进（R7） */
+    }
+    /* 0xC0..0xFF：额外字节数 = 首字节前导 1 的个数 − 1（1/2/3；≥4 视为非法 → 0）。
+     * 用 clz 一条指令算完，比逐段比较省 12 字节代码，才塞得进 0x50 的洞。 */
+    const int extra = __builtin_clz(((~c) & 0xFFu) << 24) - 1;
+    return (extra < 4) ? extra : 0;
 }
 
 // 函数体结束标签：尺寸 = patch_is_oem_mb_char_end − patch_is_oem_mb_char（自动，构建期守卫校验）
@@ -1090,9 +1089,12 @@ void fs_codepage_patch(void)
                     fs_codepage_patch_result = "wildcard_0xf4888 failed";
                     break;
                 }
-                // add w8,w25,#2 → add w8,w25,w0  (0x0B000328，imm6=0)
+                // add w8,w25,#2 → add w8,w27,w0  (0x0B000368)
+                // 原语义是 idx+2（CP932 双字节）；UTF-8 需 idx+字符总长 = idx+1+额外字节数，
+                // 而 w27 在 0xf49a4 已预先算好 idx+1（且为 callee-saved，调用后仍有效），
+                // 所以改用 w27 作基址：new = (idx+1) + w0 = idx + 总长（3 字节中文前进 3）。
                 const u8 wc_add2_cmp[] = {0x28, 0x0B, 0x00, 0x11};
-                const u8 wc_add2_patch[] = {0x28, 0x03, 0x00, 0x0B};
+                const u8 wc_add2_patch[] = {0x68, 0x03, 0x00, 0x0B};
                 ret = fs_patch_function(handle, mem_info.addr + 0xf49c4, wc_add2_cmp, sizeof(wc_add2_cmp),
                     wc_add2_patch, sizeof(wc_add2_patch));
                 if (ret != 0) {

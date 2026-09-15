@@ -51,9 +51,10 @@ FUNCTIONS = [
          site_name="PFCODE_CP932_Unicode2OEM",
          hole_src="next function 0x71000fee00 (OEMCharWidth)"),
     dict(symbol="patch_is_oem_mb_char", end_symbol="patch_is_oem_mb_char_end",
-         site=0xFEE40, hole=0x4C,
+         site=0xFEE40, hole=0x50,
          site_name="PFCODE_CP932_isOEMMBchar",
-         hole_src="original function extent 0x71000fee40..0x71000fee8c"),
+         hole_src="original extent 0xfee40..0xfee8c + the udf padding word at 0xfee8c; "
+                  "0xfee90 (mov w0,#2; ret) is a callback-table stub and must be preserved"),
     dict(symbol="patch_str_unicode2oem", end_symbol="patch_str_unicode2oem_end",
          site=0xF5840, hole=0x120,
          site_name="PFCODE_Str_Unicode2OEM",
@@ -273,7 +274,14 @@ def dec_mem(w):
                 rn=(w >> 5) & 0x1F, off=off)
 
 
-def check_word_pair(cmp_w, pat_w):
+# 允许的例外：某补丁点把"基址寄存器"换成预先算好的 idx+1 寄存器。
+# 0xf49c4 原为 `add w8,w25,#2`（idx+2，CP932 双字节语义）；UTF-8 需 idx+字符总长
+# = idx+1+额外字节数，而 w27 在 0xf49a4 已算好 idx+1（callee-saved，调用后有效），
+# 因此补丁改用 w27 作基址（单指令无法做 idx+w0+1）。
+RN_OVERRIDE = {0xF49C4: 27}
+
+
+def check_word_pair(cmp_w, pat_w, site=None):
     """校验一处被改写的 32 位指令，返回错误字符串或 None。"""
     if pat_w == NOP:
         return None                                   # -> nop 永远合法
@@ -291,7 +299,7 @@ def check_word_pair(cmp_w, pat_w):
         if a["rd"] != (cmp_w & 0x1F):
             return ("add Rd=w%d != original Rd=w%d (0x%08X)"
                     % (a["rd"], cmp_w & 0x1F, pat_w))
-        if a["rn"] != ((cmp_w >> 5) & 0x1F):
+        if a["rn"] != ((cmp_w >> 5) & 0x1F) and RN_OVERRIDE.get(site) != a["rn"]:
             return ("add Rn=w%d != original Rn=w%d (0x%08X)"
                     % (a["rn"], (cmp_w >> 5) & 0x1F, pat_w))
         # 原指令应确实是 ADD/CSEL/CSINC 之一，否则改写的语义无法确认
@@ -469,7 +477,7 @@ def main():
                 if cw == pw:
                     continue
                 changed += 1
-                err = check_word_pair(cw, pw)
+                err = check_word_pair(cw, pw, site)
                 if err:
                     status.append("BAD INSN@+%d" % i)
                     errors.append("0x%X (%s) +0x%X: 0x%08X -> 0x%08X: %s"
