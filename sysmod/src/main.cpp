@@ -866,6 +866,21 @@ int fs_patch_function(Handle handle, u64 addr, const u8 *cmp_bytes, int cmp_len,
     return 0;
 }
 
+/* fs 分步进度落盘（关键诊断手段）：
+ * 补丁一旦打坏 fs，fs 会挂死；而 sys-patch 写 SD 日志需要 fs 服务，此后
+ * 日志再也写不进去。因此在每一步“之前”就把步骤名写进 log.ini——挂死时
+ * 日志里最后一条 [debug] fs_stage 就是罪魁步骤。
+ * 仅当 enable_logging 打开时写（fs_stage_log_path != nullptr）。 */
+static const char *fs_stage_log_path = nullptr;
+
+static void fs_stage(const char *stage)
+{
+    fs_codepage_patch_result = stage;
+    if (fs_stage_log_path != nullptr) {
+        ini_puts("debug", "fs_stage", stage, fs_stage_log_path);
+    }
+}
+
 void fs_codepage_patch(void)
 {
     Handle handle{};
@@ -873,6 +888,8 @@ void fs_codepage_patch(void)
     u64 pids[0x50]{};
     s32 process_count{};
     int ret = 0;
+
+    fs_stage("start");
 
     if (R_FAILED(svcGetProcessList(&process_count, pids, 0x50))) {
         return;
@@ -919,6 +936,7 @@ void fs_codepage_patch(void)
                 // exfat
 
                 // patch IDirectory_Read，不校验字符是否合法，解决只能返回英文的问题
+                fs_stage("converters");
                 const u8 exfat_IDirectory_Read[] = {0xe3, 0xfc, 0xff, 0x54}; // b.cc name_check_err
                 const u8 exfat_IDirectory_Read_patch[] = {0x1F, 0x20, 0x03, 0xD5}; // nop
                 ret = fs_patch_function(handle, mem_info.addr + 0xd4af4, exfat_IDirectory_Read, sizeof(exfat_IDirectory_Read),
@@ -963,6 +981,7 @@ void fs_codepage_patch(void)
                 // 以下是对isOEMMBchar调用处进行patch
 
                 // patch FAT_GetNextChar (0xf45d8): 将 add x9, x8, #1 改为 add x9, x8, x0
+                fs_stage("fat_callsites");
                 // 使ptr_left根据patch_is_oem_mb_char的返回值跳过1/2/3个字节
                 const u8 exfat_FAT_GetNextChar[] = {
                     0xe0, 0x00, 0x00, 0x34, // cbz w0, label_continue
@@ -977,7 +996,7 @@ void fs_codepage_patch(void)
                 const u8 exfat_FAT_GetNextChar_patch[] = {
                     0xe0, 0x00, 0x00, 0x34, // cbz w0, label_continue
                     0x88, 0x02, 0x40, 0xf9, // ldr x8, [x20]
-                    0x09, 0x00, 0x00, 0x8b, // add x9, x8, x0  <-- 用w0做增量
+                    0x09, 0x01, 0x00, 0x8b, // add x9, x8, x0  <-- 用w0做增量（0x8B000109）
                     0x89, 0x02, 0x00, 0xf9, // str x9, [x20]
                     0x08, 0x01, 0x40, 0x79, // ldrh w8, [x8]
                     0x15, 0x21, 0x15, 0x2a, // orr w21, w8, w21, lsl #8
@@ -1040,17 +1059,21 @@ void fs_codepage_patch(void)
                 // “多字节则 idx 再 +1”改为“+ 返回值”（返回值=额外字节数），
                 // 使 1/2/3 字节 UTF-8 字符分别前进 1/2/3 字节。
                 // add w10,w9,#1 → add w10,w9,w0
+                // 编码注意：移位寄存器形式必须 imm6=0（add w10,w9,w0 = 0x0B00012A）。
+                // 曾误写成 0x0B00054A = add w10,w10,w0,lsl #1（丢失 Rn 并带位移），
+                // 会把索引算成垃圾值 —— 构建期守卫 check_patch_sizes.py 现已拦截此类错误。
+                fs_stage("wildcard_r1");
                 const u8 wc_add1_cmp[] = {0x2A, 0x05, 0x00, 0x11};
-                const u8 wc_add1_patch[] = {0x4A, 0x05, 0x00, 0x0B};
+                const u8 wc_add1_patch[] = {0x2A, 0x01, 0x00, 0x0B};
                 ret = fs_patch_function(handle, mem_info.addr + 0xf4888, wc_add1_cmp, sizeof(wc_add1_cmp),
                     wc_add1_patch, sizeof(wc_add1_patch));
                 if (ret != 0) {
                     fs_codepage_patch_result = "wildcard_0xf4888 failed";
                     break;
                 }
-                // add w8,w25,#2 → add w8,w25,w0
+                // add w8,w25,#2 → add w8,w25,w0  (0x0B000328，imm6=0)
                 const u8 wc_add2_cmp[] = {0x28, 0x0B, 0x00, 0x11};
-                const u8 wc_add2_patch[] = {0x28, 0x0B, 0x00, 0x0B};
+                const u8 wc_add2_patch[] = {0x28, 0x03, 0x00, 0x0B};
                 ret = fs_patch_function(handle, mem_info.addr + 0xf49c4, wc_add2_cmp, sizeof(wc_add2_cmp),
                     wc_add2_patch, sizeof(wc_add2_patch));
                 if (ret != 0) {
@@ -1071,6 +1094,7 @@ void fs_codepage_patch(void)
                 // 钳制为 2：3 字节字符按 2+1 消费（字节不丢、循环正常退出），
                 // 8.3 短名空间估算退回 CP932 的 2 字节/字行为。
                 // mov w23,w0 → mov w23,#2
+                fs_stage("makeshortname_r2");
                 const u8 msn_movw23_cmp[] = {0xF7, 0x03, 0x00, 0x2A};
                 const u8 msn_movw23_patch[] = {0x57, 0x00, 0x80, 0x52};
                 ret = fs_patch_function(handle, mem_info.addr + 0xf5dcc, msn_movw23_cmp, sizeof(msn_movw23_cmp),
@@ -1083,6 +1107,7 @@ void fs_codepage_patch(void)
                 // H1: PFCODE_Str_Unicode2OEM 有界替换（输出 ≤512 字节 + NUL），
                 // 修复 fat_init_fs_object_shortname 向 lname[513] 的溢出。
                 // 替换函数体必须 ≤0x120（0x71000f5960 是下一个函数）。
+                fs_stage("h1_unicode2oem");
                 const u8 exfat_Str_Unicode2OEM[16] = {
                     0xFF, 0x43, 0x01, 0xD1, 0xFD, 0x7B, 0x01, 0xA9,
                     0xF7, 0x13, 0x00, 0xF9, 0xF6, 0x57, 0x03, 0xA9
@@ -1097,6 +1122,7 @@ void fs_codepage_patch(void)
                 // R4: StringDesc_ToUpper OEM 分支 ASCII-only 替换
                 // （原版对 signed char 调 toupper，高位字节未定义行为）。
                 // 替换函数体必须 ≤0xD0（0x71000f7ce0 是下一个函数）。
+                fs_stage("r4_toupper");
                 const u8 exfat_StringDesc_ToUpper[16] = {
                     0xFD, 0x7B, 0xBD, 0xA9, 0xF5, 0x0B, 0x00, 0xF9,
                     0xF4, 0x4F, 0x02, 0xA9, 0xFD, 0x03, 0x00, 0x91
@@ -1108,7 +1134,7 @@ void fs_codepage_patch(void)
                     break;
                 }
 
-                fs_codepage_patch_result = "success";
+                fs_stage("success");
                 break;
             }
 
@@ -1133,6 +1159,9 @@ int main(int argc, char* argv[]) {
     const auto patch_sysmmc = ini_load_or_write_default("options", "patch_sysmmc", 1, ini_path);
     const auto patch_emummc = ini_load_or_write_default("options", "patch_emummc", 1, ini_path);
     const auto enable_logging = ini_load_or_write_default("options", "enable_logging", 1, ini_path);
+    // 逃生开关：置 0 可完全跳过 fs 编码补丁（其余 sys-patch 补丁照常），
+    // 用于排障/救砖，改 config.ini 即可生效，无需重新编译。
+    const auto fs_codepage_enabled = ini_load_or_write_default("options", "fs_codepage", 1, ini_path);
     VERSION_SKIP = ini_load_or_write_default("options", "version_skip", 1, ini_path);
 
     // load patch toggles
@@ -1165,7 +1194,12 @@ int main(int argc, char* argv[]) {
         for (auto& patch : patches) {
             apply_patch(patch);
         }
-        fs_codepage_patch();
+        if (fs_codepage_enabled) {
+            fs_stage_log_path = enable_logging ? log_path : nullptr;
+            fs_codepage_patch();
+        } else {
+            fs_codepage_patch_result = "disabled_by_config";
+        }
     }
 
     const auto ticks_end = armGetSystemTick();

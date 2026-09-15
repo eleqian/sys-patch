@@ -53,7 +53,7 @@ PYTHON := $(shell command -v python3 2>/dev/null || command -v python 2>/dev/nul
 .PHONY: check-patch-sizes
 check-patch-sizes:
 ifdef PYTHON
-	@$(PYTHON) sysmod/tools/check_patch_sizes.py sysmod/sys-patch.elf
+	@$(PYTHON) sysmod/tools/check_patch_sizes.py sysmod/sys-patch.elf --main sysmod/src/main.cpp
 else
 	@echo "warning: python not found, skipping patch size check"
 endif
