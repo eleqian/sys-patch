@@ -71,7 +71,7 @@ DEFAULT_FS = "D:/Design/NS/ns_reverse/FS_ghidra_1/bin/19.exfat.FS.kip1"
 # ---------------------------------------------------------------- ELF 符号表
 
 def elf_symbols(path):
-    """解析 ELF64 符号表，返回 {符号名: (st_value, st_size)}。"""
+    """返回 (符号表 {名: (st_value, st_size)}, 可寻址段 [(addr, size, bytes)])。"""
     with open(path, "rb") as f:
         data = f.read()
     if data[:4] != b"\x7fELF":
@@ -82,18 +82,29 @@ def elf_symbols(path):
     e_shentsize, e_shnum, e_shstrndx = struct.unpack_from("<HHH", data, 0x3A)
     sections = []
     for i in range(e_shnum):
-        (sh_name, sh_type, _flags, _addr, sh_offset,
+        (sh_name, sh_type, sh_flags, sh_addr, sh_offset,
          sh_size, sh_link, _info, _align, sh_entsize) = struct.unpack_from(
             "<IIQQQQIIQQ", data, e_shoff + i * e_shentsize)
-        sections.append(dict(name=sh_name, type=sh_type, offset=sh_offset,
-                             size=sh_size, link=sh_link, entsize=sh_entsize))
+        sections.append(dict(name=sh_name, type=sh_type, flags=sh_flags,
+                             addr=sh_addr, offset=sh_offset, size=sh_size,
+                             link=sh_link, entsize=sh_entsize))
+
+    shstr = sections[e_shstrndx]
 
     def cstr(blob, off):
         end = blob.index(b"\x00", off)
         return blob[off:end].decode("utf-8", "replace")
 
+    shstrtab = data[shstr["offset"]:shstr["offset"] + shstr["size"]]
+    for s in sections:
+        s["sname"] = cstr(shstrtab, s["name"]) if s["name"] else ""
+
     symbols = {}
+    segments = []
     for sec in sections:
+        if sec["type"] == 1 and (sec["flags"] & 0x2) and sec["size"]:   # PROGBITS+ALLOC
+            segments.append((sec["addr"], sec["size"],
+                             data[sec["offset"]:sec["offset"] + sec["size"]]))
         if sec["type"] != 2:  # SHT_SYMTAB
             continue
         strsec = sections[sec["link"]]
@@ -105,7 +116,99 @@ def elf_symbols(path):
             if st_name == 0:
                 continue
             symbols[cstr(strtab, st_name)] = (st_value, st_size)
-    return symbols
+    return symbols, segments
+
+
+def read_by_addr(segments, addr, size):
+    """按链接期虚拟地址从可寻址段里取字节。"""
+    for saddr, ssize, blob in segments:
+        if saddr <= addr and addr + size <= saddr + ssize:
+            off = addr - saddr
+            return blob[off:off + size]
+    return None
+
+
+# --------------------------------------------- 拷贝进 fs 的函数：位置无关性检查
+#
+# 这些函数会被原样拷到 fs 进程里执行，而 Switch 模块有加载地址随机化（ASLR）：
+# Ghidra/ELF 里的绝对地址在运行时没有意义（内存里是"链接基址 + 随机偏移"）。
+# 因此函数体内 **不得出现任何绝对地址物化**，也不得调用外部函数/引用外部数据，
+# 所有引用必须是相对自身 PC 的（adrp/adr + add）。
+# 允许的 PC 相对"本函数地址"物化：adrp xN, page + add xN, xN, #lo12 —— 因为被
+# 拷到 fs 后它算出的正是该函数在 fs 中的运行时地址（编译期常量差不变）。
+
+def scan_absolutes(code):
+    """扫描函数体，返回 (可疑绝对地址列表 [(偏移, 说明)], 允许的 fs 上下文槽访问偏移)。
+
+    只关心"像地址的宽常量"：由 MOVZ/MOVK 拼出且最终值 ≥ 0x1000000（16 MiB）。
+    小的合成常量（如返回值 0x00010002、掩码 0xfffffffd 走 MOVN）不误报。"""
+    hits = []
+    slots = []
+    reg_val = {}                     # 寄存器 -> 由 MOVZ/MOVK 拼出的当前值
+    adrp_regs = {}                   # adrp 目标寄存器 -> 偏移（等它后面的指令）
+    for off in range(0, len(code) - 3, 4):
+        w = struct.unpack_from("<I", code, off)[0]
+        rd = w & 0x1F
+        # LDR (literal) —— 字面量池在拷贝后指向 sysmod 的数据，必然错
+        if (w & 0x3B000000) == 0x18000000:
+            hits.append((off, "LDR-literal (literal pool / external data)"))
+            continue
+        # BL —— 调用函数，拷贝后跳到错误位置（本函数家族必须完全自包含）
+        if (w & 0xFC000000) == 0x94000000:
+            hits.append((off, "BL (call) -- copied code must be self-contained"))
+            continue
+        # B（无条件跳转）—— 只允许跳到函数体内（表跳转/尾调用都会跳出去）
+        if (w & 0xFC000000) == 0x14000000:
+            imm26 = w & 0x3FFFFFF
+            if imm26 & (1 << 25):
+                imm26 -= 1 << 26
+            tgt = off + (imm26 << 2)
+            if not (0 <= tgt < len(code)):
+                hits.append((off, "B branches outside the function (tail call?)"))
+            continue
+        # adrp：只允许两种用法（都必须是 PC 相对）
+        if (w & 0x9F000000) == 0x90000000:
+            adrp_regs[rd] = (off, w)
+            continue
+        if (w & 0x1F800000) == 0x12800000:      # MOVN/MOVZ/MOVK
+            opc = (w >> 29) & 3                 # 0=MOVN 2=MOVZ 3=MOVK
+            hw = (w >> 21) & 3
+            imm = (w >> 5) & 0xFFFF
+            if opc == 2:
+                reg_val[rd] = imm << (16 * hw)
+            elif opc == 3:
+                mask = 0xFFFF << (16 * hw)
+                reg_val[rd] = (reg_val.get(rd, 0) & ~mask) | (imm << (16 * hw))
+            else:
+                reg_val.pop(rd, None)           # MOVN 是掩码常量，不参与地址合成
+                continue
+            if reg_val[rd] >= 0x1000000:
+                hits.append((off, "MOVZ/MOVK builds wide constant 0x%X (address-like)"
+                             % reg_val[rd]))
+            continue
+        if rd in adrp_regs:
+            base_off, adrp_w = adrp_regs.pop(rd)
+            # 允许用法 1：adrp + add 同寄存器 —— 模块内 PC 相对访问，拷贝后仍自洽
+            if ((w >> 24) & 0x1F) == 0b01011 and ((w >> 5) & 0x1F) == rd:
+                continue
+            # 允许用法 2：adrp(+0x159000) + ldr 64-bit [同寄存器, #0xb50]
+            #            = fs+0x24eb50 代码页上下文槽（原版 fs 用的同一寻址方式）
+            immlo = (adrp_w >> 29) & 3
+            immhi = (adrp_w >> 5) & 0x7FFFF
+            imm21 = (immhi << 2) | immlo
+            if imm21 & (1 << 20):
+                imm21 -= 1 << 21
+            ldr64 = ((w >> 22) & 0x3FF) == 0b1111100101 and ((w >> 5) & 0x1F) == rd
+            if ldr64 and imm21 == 0x159 and ((w >> 10) & 0xFFF) == 0x16A:
+                slots.append(base_off)          # fs 上下文槽（PC 相对，允许）
+                continue
+            hits.append((base_off, "ADRP use not allowed (only ADRP+ADD self-relative, or the "
+                                   "fs context slot ADRP +0x159000 / LDR #0xb50): next insn "
+                                   "0x%08X" % w))
+    for base_off, _w in adrp_regs.values():
+        hits.append((base_off, "unused ADRP"))
+    return hits, slots
+
 
 
 # ------------------------------------------------- 最小 AArch64 解码（够用即可）
@@ -280,7 +383,7 @@ def main():
     args = ap.parse_args()
 
     try:
-        symbols = elf_symbols(args.elf)
+        symbols, segments = elf_symbols(args.elf)
     except OSError as e:
         sys.exit("error: cannot read ELF: %s" % e)
 
@@ -391,6 +494,38 @@ def main():
         checked += 1
 
     print("  (%s; %d instruction patch sites checked)" % (fs_note, checked))
+
+    # ---- 4. 拷入 fs 的函数必须位置无关（ASLR：禁绝绝对地址/外部引用）
+    print()
+    print("position-independence check (copied into fs, ASLR-safe):")
+    print(header % ("SYMBOL", "SECTION", "SIZE", "", "STATUS"))
+    for entry in FUNCTIONS:
+        sym = entry["symbol"]
+        syminfo = symbols.get(sym)
+        blob = None
+        if syminfo is not None:
+            blob = read_by_addr(segments, syminfo[0], syminfo[1])
+        if blob is None:
+            errors.append("%s: cannot read function bytes from ELF -- cannot verify "
+                          "position-independence" % sym)
+            print(header % (sym, "-", "-", "", "BYTES NOT FOUND"))
+            continue
+        hits, slots = scan_absolutes(blob)
+        for off in slots:
+            # 页增量 0x159 是相对"该指令所在页"的；它必须仍落在 fs+0xf5000 页，
+            # 否则算出的槽地址不是 fs+0x24eb50（洞约束保证函数不跨页，这里做显式断言）
+            if ((entry["site"] + off) & ~0xFFF) != 0xF5000:
+                errors.append("%s: context-slot ADRP at +0x%X would land in page 0x%X, "
+                              "not 0xf5000 -- the +0x159000 page delta assumes the function "
+                              "sits in fs page 0xf5000 (site 0x%X) and must not straddle pages"
+                              % (sym, off, (entry["site"] + off) & ~0xFFF, entry["site"]))
+        for off, why in hits:
+            errors.append("%s: absolute/external reference in copied code at +0x%X: %s "
+                          "-- load address is randomized (ASLR); only PC-relative "
+                          "references survive the copy into fs" % (sym, off, why))
+        print(header % (sym, "%d bytes" % len(blob), "", "",
+                        "OK" if not hits else "%d SUSPECT@%s"
+                        % (len(hits), ",".join("+0x%X" % h[0] for h in hits))))
 
     if errors:
         print()

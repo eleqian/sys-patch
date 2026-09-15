@@ -690,48 +690,66 @@ __asm__(".section .text.patch_is_oem_mb_char,\"ax\",@progbits\n\t.global patch_i
 }
 
 extern "C" {
-/* H1：字符串级 Unicode→OEM 转换有界替换（原 PFCODE_Str_Unicode2OEM @0x71000f5840）。
+/* H1：字符串级 Unicode→OEM 转换有界替换（原 PFCODE_Str_Unicode2OEM @fs+0xf5840）。
  * 原版对输出缓冲无上限——fat_init_fs_object_shortname 向 dirInfo+0x487 的
  * lname[513] 写入时，UTF-8 下 ≥171 个 CJK 字符即溢出（H1）。
- * 本替换在 512 字节处截断（含 NUL 共 ≤513），修复溢出；
- * >170 个 CJK 字符的长名会被截断，属于可接受的权衡。
- * 忠实复刻原函数两种模式：
- *  - 普通模式：逐字符调用 ctx+0x20（pUnicode2OEM，已被替换为 UTF-16→UTF-8），
- *    输出前进 oem 宽度（ret>>16）、输入前进 uni 宽度/2 个字符；
- *  - 特殊映射模式（ctx+0x48 bit1，MakeShortName 生成 8.3 占位名用）：
- *    '.'→'.'、' '→' '、其余→'_'。
+ * 本替换在 512 字节处截断（含 NUL 共 ≤513），修复溢出。
+ *
+ * **ASLR 纪律（重要）**：本函数被原样拷进 fs 进程执行，而 Switch 模块有加载地址
+ * 随机化，Ghidra/ELF 里的绝对地址（0x7100xxxx）在运行时毫无意义。因此本函数：
+ *   - 不出现任何绝对地址物化、不调用外部函数、不引用外部数据；
+ *   - 需要 fs 的代码页上下文时，用**原版同样的 PC 相对方式**取 fs 的 GOT 槽：
+ *       adrp x3, +0x159000   ; 相对"本指令所在页" → fs+0x24e000
+ *       ldr  x3, [x3, #0xb50]; → fs+0x24eb50 槽内容 = 上下文指针
+ *     （页增量是编译期常量：本函数固定落在 fs+0xf5840，页 0xf5000；
+ *       洞约束 ≤0x120 保证函数不跨页。构建期守卫会校验这两条指令的编码。）
+ *   - 普通模式的 UTF-16→UTF-8 直接内联（等价于 patch_utf16_to_utf8），
+ *     特殊映射模式直接比较 u16，因此不再需要调用 fs 内部 helper（0xde560）。
+ * 注意：不要写 `(uintptr_t)&函数名` —— -fPIE 下 GCC 会走 .data.rel.ro 指针槽，
+ * 拷贝进 fs 后同样失效（守卫会拦）。
+ * 构建期守卫 check_patch_sizes.py 会扫描函数体，禁止绝对地址物化。
  * 返回值恒 0（与原版一致）。
- * 尺寸硬约束：0x71000f5960 是下一个函数（Str_OEM2Unicode），本函数体必须 ≤0x120。 */
-typedef int (*patch_uni2oem_fn)(const u16 *src, u8 *dst);
-typedef int (*patch_strncmpw_fn)(const void *a, const void *b, int n);
+ * 尺寸硬约束：fs+0xf5960 是下一个函数（Str_OEM2Unicode），本函数体必须 ≤0x120。 */
+#define FS_CTX_GOT_OFFSET          0x24EB50u   /* fs 内 GOT 槽：代码页上下文指针 */
 
 __attribute__((used, section(".text.patch_str_unicode2oem")))
 static int patch_str_unicode2oem(char *dst_oem, const u16 *src_uni)
 {
-    u8 *ctx = *(u8 **)0x710024eb50ULL;          /* PFCODE_CODE_PAGE_CONTEXT（经 GOT） */
-    patch_uni2oem_fn conv = *(patch_uni2oem_fn *)(void *)(ctx + 0x20);
+    const u8 *ctx;
+    /* PC 相对取 fs 的上下文指针
+     * 0xb0000ac3 = adrp x3, +0x159000（相对本指令所在页 → fs+0x24e000）
+     * 0xf945a863 = ldr  x3, [x3, #0xb50]（→ fs+0x24eb50 槽 = 上下文指针） */
+    __asm__ volatile(
+        ".inst 0xb0000ac3\n\t"
+        ".inst 0xf945a863\n\t"
+        "mov %0, x3\n"
+        : "=r"(ctx)
+        :
+        : "x3");
+    u8 *out = (u8 *)dst_oem;
+    u8 *const limit = out + 512;                /* H1：输出上限 */
     const u16 *in = src_uni;
-    char *out = dst_oem;
-    char *limit = dst_oem + 512;                /* H1：输出上限 */
 
     if (ctx[0x48] & 2) {
-        /* 特殊映射模式 */
-        u16 dot = 0x2e, sp = 0x20;
-        patch_strncmpw_fn sw = (patch_strncmpw_fn)0x71000de560ULL;
+        /* 特殊映射模式：'.'→'.'、' '→' '、其余→'_' */
         while (*in != 0 && out < limit) {
-            if (sw(in, &dot, 1) == 0) {
-                *out++ = '.';
-            } else {
-                *out++ = (sw(in, &sp, 1) == 0) ? ' ' : '_';
-            }
-            in++;
+            u16 c = *in++;
+            *out++ = (c == 0x2e) ? '.' : ((c == 0x20) ? ' ' : '_');
         }
     } else {
-        /* 普通转换模式 */
+        /* 普通转换模式：内联 UTF-16→UTF-8（1~3 字节/字符） */
         while (*in != 0 && out < limit) {
-            int ret = conv(in, (u8 *)out);
-            out += (short)(ret >> 16);                  /* oem 字节宽 */
-            in += ((short)(ret & 0xffff)) >> 1;         /* uni 字符宽 */
+            u16 c = *in++;
+            if (c <= 0x7f) {
+                *out++ = (u8)c;
+            } else if (c <= 0x7ff) {
+                *out++ = (u8)(0xc0 | (c >> 6));
+                *out++ = (u8)(0x80 | (c & 0x3f));
+            } else {
+                *out++ = (u8)(0xe0 | (c >> 12));
+                *out++ = (u8)(0x80 | ((c >> 6) & 0x3f));
+                *out++ = (u8)(0x80 | (c & 0x3f));
+            }
         }
     }
     *out = '\0';
