@@ -31,20 +31,28 @@ except Exception:
     pass
 
 
-def cmp_val(ch):
-    """复刻 fs 匹配函数对单个字符的比较值。"""
+def cmp_val(ch, legacy=False):
+    """复刻 fs 匹配函数对单个字符的比较值。
+
+    legacy=False（当前默认，打了 R1b 补丁后）：
+        比较值 = (b0 << 8) | ((b2 << 8) | b1)  —— 第 3 字节以 OR 混入
+    legacy=True（R1b 之前）：
+        比较值 = (b0 << 8) | b1                —— 只看前两字节
+    """
     b = ch.encode("utf-8")
     if len(b) == 1:
         c = b[0]
         return c - 0x20 if 0x61 <= c <= 0x7A else c   # 'a'-'z' → 大写
-    return (b[0] << 8) | b[1]                          # 仅前两字节！
+    if legacy or len(b) == 2:
+        return (b[0] << 8) | b[1]
+    return (b[0] << 8) | ((b[2] << 8) | b[1])          # 3/4 字节：混入第 3 字节
 
 
-def name_sig(name):
-    return tuple(cmp_val(c) for c in name)
+def name_sig(name, legacy=False):
+    return tuple(cmp_val(c, legacy) for c in name)
 
 
-def scan(root, max_files=20000):
+def scan(root, max_files=20000, legacy=False):
     """按目录分组，返回 [(目录, [(签名组...)]), ...]"""
     files = 0
     problems = []
@@ -55,7 +63,7 @@ def scan(root, max_files=20000):
             if files > max_files:
                 problems.append((dirpath, None, "文件数超过上限，已停止扫描"))
                 return problems
-            buckets.setdefault(name_sig(fn), []).append(fn)
+            buckets.setdefault(name_sig(fn, legacy), []).append(fn)
         for sig, names in buckets.items():
             if len(names) > 1:
                 problems.append((dirpath, sorted(names), None))
@@ -63,11 +71,11 @@ def scan(root, max_files=20000):
     return problems
 
 
-def explain(name):
-    print("名字: %s" % name)
+def explain(name, legacy=False):
+    print("名字: %s (%s)" % (name, "R1b 之前" if legacy else "当前/打了 R1b"))
     vals = []
     for ch in name:
-        vals.append("%s(U+%04X)=0x%04X" % (ch, ord(ch), cmp_val(ch)))
+        vals.append("%s(U+%04X)=0x%04X" % (ch, ord(ch), cmp_val(ch, legacy)))
     print("比较值序列: %s" % " ".join(vals))
     print("\n各字符的「同值」字符（同 64 码位块，fs 无法区分）：")
     for ch in name:
@@ -85,16 +93,17 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("path", nargs="?", help="要扫描的目录")
     ap.add_argument("--explain", help="显示某个名字的比较值与同值字符")
+    ap.add_argument("--legacy", action="store_true", help="按 R1b 补丁之前的规则（只看前两字节）")
     ap.add_argument("--max-files", type=int, default=20000)
     args = ap.parse_args()
 
     if args.explain:
-        explain(args.explain)
+        explain(args.explain, args.legacy)
         return
     if not args.path:
         ap.error("需要指定目录，或使用 --explain")
 
-    problems = scan(args.path, args.max_files)
+    problems = scan(args.path, args.max_files, args.legacy)
     if not problems:
         print("未发现 fs 视角同名的冲突（%s）" % args.path)
         return

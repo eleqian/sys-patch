@@ -1115,6 +1115,34 @@ void fs_codepage_patch(void)
                 // 钳制为 2：3 字节字符按 2+1 消费（字节不丢、循环正常退出），
                 // 8.3 短名空间估算退回 CP932 的 2 字节/字行为。
                 // mov w23,w0 → mov w23,#2
+                // R1b：匹配器内联取字符的三处 ldrb → ldrh。
+                // 与 FAT_GetNextChar(0xf45e8) 早已改过的 ldrh 口径统一：
+                //   比较值 = (b0 << 8) | ((b2 << 8) | b1) —— 把第 3 个字节纳入比较。
+                // 效果（常用汉字区实测）：同值组 327 → 1424，最大同值字数 64 → 48，
+                // `中` 与 `一` 从此可区分。注意这不是彻底修复（见 re_utf8_patch_final.md §6.1）。
+                const u8 wc_ldrb_cmp[] = {0x08, 0x69, 0x69, 0x38};      // ldrb w8, [x8, x9]
+                const u8 wc_ldrh_patch[] = {0x08, 0x69, 0x69, 0x78};    // ldrh w8, [x8, x9]
+                ret = fs_patch_function(handle, mem_info.addr + 0xf4894, wc_ldrb_cmp, sizeof(wc_ldrb_cmp),
+                    wc_ldrh_patch, sizeof(wc_ldrh_patch));
+                if (ret != 0) {
+                    fs_codepage_patch_result = "wildcard_ldrh_0xf4894 failed";
+                    break;
+                }
+                const u8 wc_ldrb_cmp2[] = {0x48, 0x6B, 0x7B, 0x38};     // ldrb w8, [x26, x27]
+                const u8 wc_ldrh_patch2[] = {0x48, 0x6B, 0x7B, 0x78};   // ldrh w8, [x26, x27]
+                ret = fs_patch_function(handle, mem_info.addr + 0xf49cc, wc_ldrb_cmp2, sizeof(wc_ldrb_cmp2),
+                    wc_ldrh_patch2, sizeof(wc_ldrh_patch2));
+                if (ret != 0) {
+                    fs_codepage_patch_result = "wildcard_ldrh_0xf49cc failed";
+                    break;
+                }
+                ret = fs_patch_function(handle, mem_info.addr + 0xf4a9c, wc_ldrb_cmp, sizeof(wc_ldrb_cmp),
+                    wc_ldrh_patch, sizeof(wc_ldrh_patch));
+                if (ret != 0) {
+                    fs_codepage_patch_result = "wildcard_ldrh_0xf4a9c failed";
+                    break;
+                }
+
                 if (fs_stage_limit <= 3) break;      /* stage=3：应用到 R1 通配符步进 */
                 fs_stage("makeshortname_r2");
                 const u8 msn_movw23_cmp[] = {0xF7, 0x03, 0x00, 0x2A};
