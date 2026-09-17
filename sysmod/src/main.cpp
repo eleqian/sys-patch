@@ -890,6 +890,7 @@ int fs_patch_function(Handle handle, u64 addr, const u8 *cmp_bytes, int cmp_len,
  * 若补丁过程中真的挂死，日志会是空的，此时用 config.ini 的
  * [fs_codepage] stage=N 逐组二分定位。 */
 static int fs_stage_limit = 99;             /* 允许应用到第几组（config.ini 控制） */
+static bool fs_wide_cmp = true;             /* R1c：24 位比较值（config.ini [fs_codepage] wide_cmp） */
 
 static void fs_stage(const char *stage)
 {
@@ -1143,6 +1144,66 @@ void fs_codepage_patch(void)
                     break;
                 }
 
+                /* R1c：把比较值扩到 24 位，彻底消除 3 字节汉字的同名误判。
+                 * 现有指令只把第 3 字节"或"进高字节（仍有丢位），改为
+                 *   value = (b0 << 16) | (b2 << 8) | b1        ← 完整 3 字节，单射
+                 * 共 10 处：
+                 *  A. 值构造 orr wN,w8,wN,lsl #8 → #16（4 处，含 FAT_GetNextChar 0xf45ec）
+                 *  B. 去掉 16 位掩码 and w8,wN,#0xffff → mov w8,wN（4 处）
+                 *  C. 去掉比较时的 uxth 扩展 cmp w8,wN,uxth → cmp w8,wN（2 处）
+                 * 未改：0xf47dc/0xf497c/0xf4a48（全角折叠判定，对汉字是空操作）、
+                 *       0xf492c（来自 ctx 的字段，非比较值）。
+                 * 开关：config.ini [fs_codepage] wide_cmp=0 可退回 R1b 行为。 */
+                if (fs_wide_cmp) {
+                    fs_stage("wide_cmp");
+                    const u8 orr_lsl8_cmp[] = {0x15, 0x21, 0x15, 0x2A};   // orr w21,w8,w21,lsl #8
+                    const u8 orr_lsl16_patch[] = {0x15, 0x41, 0x15, 0x2A}; // orr w21,w8,w21,lsl #16
+                    const u8 orr_lsl8_cmp_b[] = {0x16, 0x21, 0x16, 0x2A};  // orr w22,w8,w22,lsl #8
+                    const u8 orr_lsl16_patch_b[] = {0x16, 0x41, 0x16, 0x2A};// orr w22,w8,w22,lsl #16
+                    ret = fs_patch_function(handle, mem_info.addr + 0xf45ec, orr_lsl8_cmp, sizeof(orr_lsl8_cmp),
+                        orr_lsl16_patch, sizeof(orr_lsl16_patch));
+                    if (ret != 0) { fs_codepage_patch_result = "wide_cmp_0xf45ec failed"; break; }
+                    ret = fs_patch_function(handle, mem_info.addr + 0xf4898, orr_lsl8_cmp, sizeof(orr_lsl8_cmp),
+                        orr_lsl16_patch, sizeof(orr_lsl16_patch));
+                    if (ret != 0) { fs_codepage_patch_result = "wide_cmp_0xf4898 failed"; break; }
+                    ret = fs_patch_function(handle, mem_info.addr + 0xf49d0, orr_lsl8_cmp_b, sizeof(orr_lsl8_cmp_b),
+                        orr_lsl16_patch_b, sizeof(orr_lsl16_patch_b));
+                    if (ret != 0) { fs_codepage_patch_result = "wide_cmp_0xf49d0 failed"; break; }
+                    ret = fs_patch_function(handle, mem_info.addr + 0xf4aa0, orr_lsl8_cmp_b, sizeof(orr_lsl8_cmp_b),
+                        orr_lsl16_patch_b, sizeof(orr_lsl16_patch_b));
+                    if (ret != 0) { fs_codepage_patch_result = "wide_cmp_0xf4aa0 failed"; break; }
+
+                    const u8 and_w2_cmp[] = {0x48, 0x3C, 0x00, 0x12};     // and w8, w2, #0xffff
+                    const u8 mov_w2_patch[] = {0xE8, 0x03, 0x02, 0x2A};   // mov w8, w2
+                    ret = fs_patch_function(handle, mem_info.addr + 0xf47f4, and_w2_cmp, sizeof(and_w2_cmp),
+                        mov_w2_patch, sizeof(mov_w2_patch));
+                    if (ret != 0) { fs_codepage_patch_result = "wide_cmp_0xf47f4 failed"; break; }
+                    const u8 and_w0_cmp[] = {0x08, 0x3C, 0x00, 0x12};     // and w8, w0, #0xffff
+                    const u8 mov_w0_patch[] = {0xE8, 0x03, 0x00, 0x2A};   // mov w8, w0
+                    ret = fs_patch_function(handle, mem_info.addr + 0xf48c0, and_w0_cmp, sizeof(and_w0_cmp),
+                        mov_w0_patch, sizeof(mov_w0_patch));
+                    if (ret != 0) { fs_codepage_patch_result = "wide_cmp_0xf48c0 failed"; break; }
+                    const u8 and_w22_cmp[] = {0xC8, 0x3E, 0x00, 0x12};    // and w8, w22, #0xffff
+                    const u8 mov_w22_patch[] = {0xE8, 0x03, 0x16, 0x2A};  // mov w8, w22
+                    ret = fs_patch_function(handle, mem_info.addr + 0xf480c, and_w22_cmp, sizeof(and_w22_cmp),
+                        mov_w22_patch, sizeof(mov_w22_patch));
+                    if (ret != 0) { fs_codepage_patch_result = "wide_cmp_0xf480c failed"; break; }
+                    ret = fs_patch_function(handle, mem_info.addr + 0xf4918, and_w22_cmp, sizeof(and_w22_cmp),
+                        mov_w22_patch, sizeof(mov_w22_patch));
+                    if (ret != 0) { fs_codepage_patch_result = "wide_cmp_0xf4918 failed"; break; }
+
+                    const u8 cmp_uxth_w2[] = {0x1F, 0x21, 0x22, 0x6B};    // cmp w8, w2, uxth
+                    const u8 cmp_w2_patch[] = {0x1F, 0x01, 0x02, 0x6B};   // cmp w8, w2
+                    ret = fs_patch_function(handle, mem_info.addr + 0xf4810, cmp_uxth_w2, sizeof(cmp_uxth_w2),
+                        cmp_w2_patch, sizeof(cmp_w2_patch));
+                    if (ret != 0) { fs_codepage_patch_result = "wide_cmp_0xf4810 failed"; break; }
+                    const u8 cmp_uxth_w21[] = {0x1F, 0x21, 0x35, 0x6B};   // cmp w8, w21, uxth
+                    const u8 cmp_w21_patch[] = {0x1F, 0x01, 0x15, 0x6B};  // cmp w8, w21
+                    ret = fs_patch_function(handle, mem_info.addr + 0xf491c, cmp_uxth_w21, sizeof(cmp_uxth_w21),
+                        cmp_w21_patch, sizeof(cmp_w21_patch));
+                    if (ret != 0) { fs_codepage_patch_result = "wide_cmp_0xf491c failed"; break; }
+                }
+
                 if (fs_stage_limit <= 3) break;      /* stage=3：应用到 R1 通配符步进 */
                 fs_stage("makeshortname_r2");
                 const u8 msn_movw23_cmp[] = {0xF7, 0x03, 0x00, 0x2A};
@@ -1217,6 +1278,8 @@ int main(int argc, char* argv[]) {
     // 逐组二分开关：0 = 一组都不应用，1..5 = 应用到该组，6/未设置 = 全部应用。
     // 补丁把 fs 打挂时，日志写不出来（附加调试后 fs 被挂起），用这个开关二分定位。
     fs_stage_limit = ini_load_or_write_default("fs_codepage", "stage", 6, ini_path);
+    // wide_cmp=0 可退回"只到第 3 字节按位或"的 R1b 行为（同名误判概率更高但更保守）。
+    fs_wide_cmp = ini_load_or_write_default("fs_codepage", "wide_cmp", 1, ini_path) != 0;
     VERSION_SKIP = ini_load_or_write_default("options", "version_skip", 1, ini_path);
 
     // load patch toggles

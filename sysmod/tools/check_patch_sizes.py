@@ -225,8 +225,11 @@ def dec_add_imm(w):
 
 
 def dec_add_reg(w):
-    """ADD (shifted register)。返回 None 或 dict(sf, rd, rn, rm, shift, imm6)。"""
+    """ADD (shifted register)。返回 None 或 dict(sf, rd, rn, rm, shift, imm6)。
+    注意 op/S(bits30:29) 必须为 00 —— 01=ADDS、10=SUB、11=SUBS（cmp 属此类，不能当 add）。"""
     if ((w >> 24) & 0x1F) != 0b01011:
+        return None
+    if ((w >> 29) & 3) != 0b00:            # 排除 ADDS/SUB/SUBS
         return None
     if (w >> 21) & 1:                      # bit21=1 = SUB
         return None
@@ -241,6 +244,37 @@ def dec_csel_csinc(w):
     if (w >> 30) & 1:                      # op=1 = CSINV/CSNEG
         return None
     return dict(sf=(w >> 31) & 1, rd=w & 0x1F, rn=(w >> 5) & 0x1F, op2=(w >> 10) & 3)
+
+
+def dec_orr_reg(w):
+    """ORR (shifted register) —— 含 mov 别名（Rn=wzr）。"""
+    if ((w >> 24) & 0x1F) != 0b01010 or ((w >> 29) & 3) != 0b01:
+        return None
+    return dict(sf=(w >> 31) & 1, rd=w & 0x1F, rn=(w >> 5) & 0x1F,
+                rm=(w >> 16) & 0x1F, shift=(w >> 22) & 3, imm6=(w >> 10) & 0x3F)
+
+
+def dec_and_imm(w):
+    """AND (immediate)。"""
+    if (w & 0x7F800000) != 0x12000000:
+        return None
+    return dict(sf=(w >> 31) & 1, rd=w & 0x1F, rn=(w >> 5) & 0x1F)
+
+
+def dec_subs_shift(w):
+    """SUBS (shifted register) —— 含 cmp 别名（Rd=wzr）。"""
+    if ((w >> 24) & 0x1F) != 0b01011 or ((w >> 21) & 1) != 0:
+        return None
+    return dict(sf=(w >> 31) & 1, rd=w & 0x1F, rn=(w >> 5) & 0x1F,
+                rm=(w >> 16) & 0x1F, shift=(w >> 22) & 3, imm6=(w >> 10) & 0x3F)
+
+
+def dec_subs_ext(w):
+    """SUBS (extended register) —— 含 cmp wN, wM, uxth 形式。"""
+    if ((w >> 24) & 0x1F) != 0b01011 or ((w >> 21) & 1) != 1:
+        return None
+    return dict(sf=(w >> 31) & 1, rd=w & 0x1F, rn=(w >> 5) & 0x1F,
+                rm=(w >> 16) & 0x1F, option=(w >> 13) & 7, imm3=(w >> 10) & 7)
 
 
 def dec_movz(w):
@@ -327,7 +361,25 @@ def check_word_pair(cmp_w, pat_w, site=None):
                        pm["rn"], pm["off"], pm["rt"], pm["load"]))
         return None
 
-    return "unsupported patch encoding 0x%08X (only nop / add Rd,Rn,w0 / movz / same-addr width change)" % pat_w
+    # 允许：orr (shifted) 仅调整移位量 —— 24 位比较值构造（lsl #8 -> #16）
+    co, po = dec_orr_reg(cmp_w), dec_orr_reg(pat_w)
+    if co and po and (co["sf"], co["rd"], co["rn"], co["rm"]) == \
+       (po["sf"], po["rd"], po["rn"], po["rm"]) and co["shift"] == 0 == po["shift"]:
+        return None
+    # 允许：and #imm -> mov（去掉 16 位掩码，且不能换寄存器）
+    ca = dec_and_imm(cmp_w)
+    if ca and po and po["rn"] == 31 and po["rd"] == ca["rd"] and \
+       po["rm"] == ca["rn"] and po["shift"] == 0 and po["imm6"] == 0:
+        return None
+    # 允许：cmp Rn,Rm,uxth -> cmp Rn,Rm（去掉 UXTH 扩展）
+    ce, ps = dec_subs_ext(cmp_w), dec_subs_shift(pat_w)
+    if ce and ps and ce["option"] == 0b001 and ce["imm3"] == 0 and \
+       (ce["sf"], ce["rd"], ce["rn"], ce["rm"]) == \
+       (ps["sf"], ps["rd"], ps["rn"], ps["rm"]) and ps["shift"] == 0 and ps["imm6"] == 0:
+        return None
+
+    return ("unsupported patch encoding 0x%08X (allowed: nop / add Rd,Rn,w0 / movz / "
+            "same-addr width change / orr shift amount / and->mov / cmp uxth->cmp)" % pat_w)
 
 
 # --------------------------------------------------- main.cpp 提取补丁对

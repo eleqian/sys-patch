@@ -31,28 +31,35 @@ except Exception:
     pass
 
 
-def cmp_val(ch, legacy=False):
+def cmp_val(ch, mode="wide"):
     """复刻 fs 匹配函数对单个字符的比较值。
 
-    legacy=False（当前默认，打了 R1b 补丁后）：
-        比较值 = (b0 << 8) | ((b2 << 8) | b1)  —— 第 3 字节以 OR 混入
-    legacy=True（R1b 之前）：
-        比较值 = (b0 << 8) | b1                —— 只看前两字节
+    mode="wide"（当前默认，R1c 打了 24 位比较值后）：
+        比较值 = (b0 << 16) | (b2 << 8) | b1 —— 1~3 字节字符完整参与比较（单射，无碰撞）；
+        4 字节字符（emoji 等）仍只取前 3 字节，会残留碰撞。
+    mode="r1b"（只打了 R1b，未打 R1c）：
+        比较值 = (b0 << 8) | ((b2 << 8) | b1) —— 第 3 字节以按位或混入，仍丢位。
+    mode="legacy"（R1b 之前）：
+        比较值 = (b0 << 8) | b1 —— 只看前两字节，常用汉字 64 字一组互撞。
     """
     b = ch.encode("utf-8")
     if len(b) == 1:
         c = b[0]
         return c - 0x20 if 0x61 <= c <= 0x7A else c   # 'a'-'z' → 大写
-    if legacy or len(b) == 2:
+    if len(b) == 2:
+        return (b[0] << 8) | b[1]                      # 2 字节：完整
+    if mode == "legacy":
         return (b[0] << 8) | b[1]
-    return (b[0] << 8) | ((b[2] << 8) | b[1])          # 3/4 字节：混入第 3 字节
+    if mode == "r1b":
+        return (b[0] << 8) | ((b[2] << 8) | b[1])
+    return (b[0] << 16) | (b[2] << 8) | b[1]           # wide：完整 3 字节
 
 
-def name_sig(name, legacy=False):
-    return tuple(cmp_val(c, legacy) for c in name)
+def name_sig(name, mode="wide"):
+    return tuple(cmp_val(c, mode) for c in name)
 
 
-def scan(root, max_files=20000, legacy=False):
+def scan(root, max_files=20000, mode="wide"):
     """按目录分组，返回 [(目录, [(签名组...)]), ...]"""
     files = 0
     problems = []
@@ -63,7 +70,7 @@ def scan(root, max_files=20000, legacy=False):
             if files > max_files:
                 problems.append((dirpath, None, "文件数超过上限，已停止扫描"))
                 return problems
-            buckets.setdefault(name_sig(fn, legacy), []).append(fn)
+            buckets.setdefault(name_sig(fn, mode), []).append(fn)
         for sig, names in buckets.items():
             if len(names) > 1:
                 problems.append((dirpath, sorted(names), None))
@@ -71,11 +78,11 @@ def scan(root, max_files=20000, legacy=False):
     return problems
 
 
-def explain(name, legacy=False):
-    print("名字: %s (%s)" % (name, "R1b 之前" if legacy else "当前/打了 R1b"))
+def explain(name, mode="wide"):
+    print("名字: %s (比较值口径: %s)" % (name, mode))
     vals = []
     for ch in name:
-        vals.append("%s(U+%04X)=0x%04X" % (ch, ord(ch), cmp_val(ch, legacy)))
+        vals.append("%s(U+%04X)=0x%06X" % (ch, ord(ch), cmp_val(ch, mode)))
     print("比较值序列: %s" % " ".join(vals))
     print("\n各字符的「同值」字符（同 64 码位块，fs 无法区分）：")
     for ch in name:
@@ -93,17 +100,18 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("path", nargs="?", help="要扫描的目录")
     ap.add_argument("--explain", help="显示某个名字的比较值与同值字符")
-    ap.add_argument("--legacy", action="store_true", help="按 R1b 补丁之前的规则（只看前两字节）")
+    ap.add_argument("--mode", choices=("wide", "r1b", "legacy"), default="wide",
+                    help="比较值口径：wide(默认，R1c 后) / r1b(仅 R1b) / legacy(R1b 前)")
     ap.add_argument("--max-files", type=int, default=20000)
     args = ap.parse_args()
 
     if args.explain:
-        explain(args.explain, args.legacy)
+        explain(args.explain, args.mode)
         return
     if not args.path:
         ap.error("需要指定目录，或使用 --explain")
 
-    problems = scan(args.path, args.max_files, args.legacy)
+    problems = scan(args.path, args.max_files, args.mode)
     if not problems:
         print("未发现 fs 视角同名的冲突（%s）" % args.path)
         return
