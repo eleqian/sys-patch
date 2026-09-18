@@ -13,4 +13,6 @@ firmware
 *.nca
 out
 ignoreme
+.tmp/
+.workbuddy/
 .vscode/settings.json
