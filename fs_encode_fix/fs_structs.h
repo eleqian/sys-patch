@@ -286,17 +286,29 @@ typedef struct FsDrvObject {
                  *pRootSearchObj_0xb0;     /* 0x0b0 FatDirSearchObject (0x28) paired with
                                             *      pRootObj_0xa8; saved/restored by
                                             *      fat_mount_volume_core the same way */
-    u32  dwField_0xb8;                     /* 0x0b8 media-info flags */
+    u32  dwFatRegionCacheType;             /* 0x0b8 FAT 区域缓存类型: exfat_init_cluster_bitmap_cache
+                                            *      与 fat_init_fat_table 均写 2 (2=exFAT/FAT32 缓存) */
     u32  dwVolume_flags_0xbc;              /* 0x0bc media-change / dirty flags */
-    u32  dwField_0xc0;                     /* 0x0c0 per-volume config flags (from storage driver) */
-    u16  wVolume_config_0xc4;              /* 0x0c4 max-cluster config value */
-    u16  wVolume_config_0xc6;              /* 0x0c6 cluster-size config value */
-    u32  dwCode_page_state;                /* 0x0c8 code-page ctx state: 0=uninit, 1=initialized
-                                            *      (target of fat_init_code_page_context, which
-                                            *      also uses qLock_0x128 as its object slot) */
-    u8   _reserved0xcc[4];                 /* 0x0cc */
-    void *pCode_page_slot;                 /* 0x0d0 allocated PFCODE/CP932 slot */
-    u8   _reserved0xd8[0x10];              /* 0x0d8 */
+    u32  dwFatRegionCacheFlags;            /* 0x0c0 低 3 位 = 缓存类型 (初始化置 2); 位图改写期间
+                                            *      置 bit1, 结束后按 bit0 置 bit4
+                                            *      (exfat_bitmap_operation 0x71000eff10) */
+    u16  wFatCacheEntryCount_0xc4;         /* 0x0c4 缓存区 A 节点数 (旧记 max-cluster config) */
+    u16  wFatCacheEntryCount_0xc6;         /* 0x0c6 缓存区 B 节点数 (旧记 cluster-size config);
+                                            *      数据缓冲字节数 = (0xc4 + 0xc6) * 0x200 */
+    /* --- FAT 区域 / exFAT 簇位图缓存描述符 (第十九轮:
+     *     exfat_init_cluster_bitmap_cache @0x71000e3450, fat_init_fat_table @0x71000e3200,
+     *     fat_init_fat_region_cache @0x71000e32c0 机器码验证) ---
+     * 缓存节点 0x28 字节/个, 数据 0x200 字节/个; 节点数 = wFatCacheEntryCount_0xc4 + _0xc6。
+     * FAT32 用两个槽 (主 FAT type=4 / 备 FAT type=8), exFAT 只用 slot1 (type=0x10)。 */
+    union {
+        u32  dwCode_page_state;            /* 0x0c8 低 32 位 = code-page ctx state (0=uninit, 1=init);
+                                            *      fat_init_code_page_context 以 qLock_0x128 为对象槽 */
+        void *pFatRegionCache_nodes;       /* 0x0c8 缓存节点数组基址 (fat_init_fat_region_cache arg2) */
+    };
+    void *pFatRegionCache_slot0;           /* 0x0d0 缓存描述符槽 0 (exFAT 路径置 0; FAT32 = 主 FAT) */
+    void *pFatRegionCache_slot1;           /* 0x0d8 缓存描述符槽 1 = fat_init_fat_region_cache arg1
+                                            *      (写入节点数组基址; exFAT 位图缓存用此槽) */
+    void *pFatRegionCache_buffer;          /* 0x0e0 缓存数据缓冲基址 (节点 i 数据 = base + i*0x200) */
     u32  dwVolume_flags_config;            /* 0x0e8 volume flags config (fat_set_volume_flags) */
     u32  dwVolume_config;                  /* 0x0ec volume config (fat_set_volume_config) */
     u32  dwField_0xf0;                     /* 0x0f0 */
@@ -334,7 +346,19 @@ typedef struct FsDrvObject {
     u32  dwF_0x15c;                        /* 0x15c */
     u32  dwTransaction_id;                 /* 0x160 transaction op id (0x12 mount, 0x34 config) */
     u32  dwTransaction_result;             /* 0x164 result of the last transaction */
-    u8   _reserved0x168[0x38];             /* 0x168 .. 0x19f */
+    u8   _reserved0x168[0x18];             /* 0x168 .. 0x17f */
+    /* --- exFAT Allocation Bitmap 定位信息 (第十九轮: exfat_get_bitmap_info
+     *     @0x71000f0a90 读写, exfat_check_cluster_allocated @0x71000ef470 /
+     *     exfat_bitmap_operation @0x71000eff10 消费) --- */
+    s32  dwBitmapFirstCluster;             /* 0x180 位图首簇; 0=未定位 (首次调用时到根目录搜
+                                            *      attr 0x81 的位图条目并缓存) */
+    u8   _padBitmap_0x184[4];              /* 0x184 (u64 对齐间隙) */
+    u64  qBitmapSize;                      /* 0x188 位图字节数 (= 位图文件 DataLength);
+                                            *      边界检查: (cluster-2)>>3 < qBitmapSize */
+    u8   _reserved0x190[8];                /* 0x190 .. 0x197 */
+    u16  wBitmapOpFlags;                   /* 0x198 位图改写状态: exfat_bitmap_operation 进入时置 bit1,
+                                            *      返回前若 bit0 置位则再置 bit4 (脏/失败标记) */
+    u8   _reserved0x19a[6];                /* 0x19a .. 0x19f */
     /* --- exFAT UpCase 表缓存（第十八轮: exfat_resolve_path 0x71000fb6a0 +
      *     exfat_verify_upcase_table 0x71000fbe70 机器码验证）--- */
     u32  dwUpcase_first_cluster;           /* 0x1a0 UpCase 表首簇 (0xffffffff=未定位) */
@@ -346,7 +370,13 @@ typedef struct FsDrvObject {
     u32  dwUpcase_cache_capacity;          /* 0x1c0 缓存容量 */
     u32  dwUpcase_flags;                   /* 0x1c4 bit30=表已读入并校验通过(驻留) */
     u64  qStorage_handle_0x1c8;            /* 0x1c8 storage device handle (arg to fs_storage_*) */
-    u8   reserved_0x1d0[0x48];             /* 0x1d0 .. 0x217 (72 bytes, contents unknown) */
+    u8   reserved_0x1d0[0x38];             /* 0x1d0 .. 0x207 (56 bytes, 内容未定性) */
+    /* --- 簇运行粒度 / 对齐锚点 (第十九轮: exfat_scan_free_clusters 0x71000f0360 与
+     *     exfat_update_free_cluster_count 0x71000f0be0 机器码验证; 二者均以
+     *     "reserved_0x1d0 + 0x38 / +0x3c" 形式访问) --- */
+    u32  dwClusterRunGranularity;          /* 0x208 连续簇粒度 (碎片统计/对齐单位; <2 时跳过统计) */
+    u32  dwClusterAlignAnchor;             /* 0x20c 簇对齐锚点 (每次比较后按 +0x208 递增) */
+    u8   _reserved0x210[8];                /* 0x210 .. 0x217 */
     u8   dirCache[0x6A0];                  /* 0x218 directory cache (1696 bytes).
                                             *      Handed out by fs_get_volume_dir_cache
                                             *      (returns drvObj+0x218), stored by
@@ -864,7 +894,14 @@ FS_ASSERT_OFF(FsDrvObject, pDirSearchObj_array,         0x090);
 FS_ASSERT_OFF(FsDrvObject, nOpenFileRefCount,           0x098);
 FS_ASSERT_OFF(FsDrvObject, nOpenDirRefCount,            0x09c);
 FS_ASSERT_OFF(FsDrvObject, dwCode_page_state,           0x0c8);
-FS_ASSERT_OFF(FsDrvObject, pCode_page_slot,             0x0d0);
+FS_ASSERT_OFF(FsDrvObject, pFatRegionCache_slot0,       0x0d0);
+FS_ASSERT_OFF(FsDrvObject, pFatRegionCache_slot1,       0x0d8);
+FS_ASSERT_OFF(FsDrvObject, pFatRegionCache_buffer,      0x0e0);
+FS_ASSERT_OFF(FsDrvObject, dwBitmapFirstCluster,        0x180);
+FS_ASSERT_OFF(FsDrvObject, qBitmapSize,                 0x188);
+FS_ASSERT_OFF(FsDrvObject, wBitmapOpFlags,              0x198);
+FS_ASSERT_OFF(FsDrvObject, dwClusterRunGranularity,     0x208);
+FS_ASSERT_OFF(FsDrvObject, dwClusterAlignAnchor,        0x20c);
 FS_ASSERT_OFF(FsDrvObject, dwVolume_flags_config,       0x0e8);
 FS_ASSERT_OFF(FsDrvObject, dwVolume_config,             0x0ec);
 FS_ASSERT_OFF(FsDrvObject, pLock_0xf8,                  0x0f8);

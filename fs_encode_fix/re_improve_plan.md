@@ -1,5 +1,15 @@
 # 中文路径（codepage）补丁方案改进分析
 
+> **状态：改进项清单（2026-09-15 起草），绝大多数已实施 —— 完成度见下，不要按本文当"待办"。**
+> - 已落地：pattern 驱动无硬编码偏移（**P1**）、`WideChar_Compare` 整函数替换（**M6**）、
+>   `FAT_GetNextChar` 整函数替换（**M8**）、14.1.2/15.0.1 变体族覆盖、扫描结构三项优化（**P3**）、
+>   构建期守卫 + 离线等价性/差分验证。
+> - 现状权威文档：`re_utf8_patch_final.md`（方案与实现定稿）、`AGENTS.md`（FS codepage patch 一节）、
+>   `../补丁点合并优化分析.md`（设计现状与决策台账）、
+>   `补丁点合并优化分析·演进史.md`（§13/§14/§16/§18 为合并决策，§19 为扫描优化）。
+> - 本文里"现行补丁面 / `sysmod/src/main.cpp` 的 `fs_codepage_patch()`"指 2026-09-15 的形态：
+>   该函数 2026-09-19 已拆到 **`sysmod/src/fs_codepage.cpp`**，表也从 `main.cpp` 迁出。
+
 > 依据：`re_analysis.md`（十二轮逆向，2026-09-14 第十八轮收尾）+ `sysmod/src/main.cpp` 现行实现。
 > 目标：把逆向结论转化为可落地的补丁改进项，按优先级排列，每项给出技术方案、影响面与前置验证。
 
@@ -17,6 +27,17 @@
 
 共性风险：全部为**硬编码偏移且无固件版本门控**，仅对派生偏移的那份 FS（19.exfat.FS.kip1）有效。
 
+> **偏移→函数名映射**（2026-09-15 第十九轮补全，换固件重推时按名定位）：
+> `0xd4af4`=`IDirectory_Read`(+0xd4)；`0xfeac0`/`0xfec30`/`0xfee40`=`PFCODE_CP932_OEM2Unicode`/
+> `Unicode2OEM`/`isOEMMBchar` **函数入口**；`0xf45d8`=`FAT_GetNextChar`(+0xf8)；
+> `0xf4d8c`=`FAT_GetNextPathComponent`(+0x1cc)；`0xf77e8`/`0xf7984`/`0xf7a80`/`0xf7bd0`=
+> `StringDesc_AddLeft`/`GetCharCount`/`CompareUnicode`/`CompareOem`。
+> 规律：3 个入口=换实现，7 个消费点=改步进。详表见 `re_ghidra_round19.md` §5.5。
+
+> **2026-09-15 复核**：上表 P1-1 提到的"改 +返回值"系列，实际落地情况与本节旧描述有出入
+> ——`FAT_MakeShortName` 用 `pOEMCharWidth`（非 isMB）、`FAT_ReplaceShortNameNumber` 无需改，
+> **以 §6 实施状态为准**（R2 已修、R3 判误报）。本节保留原文仅供追溯。
+
 ---
 
 ## 2. 最新逆向结论对方案的定性影响
@@ -27,6 +48,26 @@
 3. **isOEMMBchar/GetNextChar 步进系列只服务 OEM 域比较**（FAT32 匹配、8.3 短名、通配符）⇒ R1/R2/R3/R7 的影响面收敛为"FAT32 与短名回退路径"，exFAT 日常读写不受其影响，优先级可定为 P1。
 4. **`<N>` 索引打开**：NameHash 硬门下 `hash("<N>")` 不等于真实名 hash，`<N>` 打开应走枚举路径——列入上机边界测试，暂不改代码。
 5. 显示方向（§8.3）只经过 Unicode2OEM 且不依赖 isMB/GetNextChar ⇒ 显示稳定性不依赖 P1 项；H1 是显示方向唯一高危。
+
+> 以下 6–9 条为 **2026-09-15 第十九轮 GHIDRA 复核**新增（详见 `re_ghidra_round19.md` §5.5–5.7）。
+
+6. **CP932 六回调槽全定性**（`PFCODE_CODE_PAGE_CONTEXT` @`0x7100fcfc38`）：
+   `+0x18` OEM2Unicode、`+0x20` Unicode2OEM、`+0x28` OEMCharWidth、`+0x30` isOEMMBchar、
+   `+0x38` **UnicodeCharWidth（恒 2）**、`+0x40` **isUnicodeMBchar（恒 false）**。
+   ⇒ CP932 的 Unicode 通道**没有多字节/变长概念**；若将来把 UTF-8 接进 Unicode 通道，
+   变长逻辑必须全部自写，无现成回调可复用。注册点 `PFCODE_CP932_Init` @`0x71000d5150`
+   （`0x710010ee40` 是跳过去的 thunk，非第二份实现）。
+7. **转换器返回值本就带宽度**：`ConvertWidth(oemW,uniW) = oemW<<16|uniW`，`GetConvertWidth` 解包
+   ⇒ 返回值高 16 = 消耗的 OEM 字节数、低 16 = 产生的 UTF-16 码元数。现有消费方并未使用它
+   （统一走 `pOEMCharWidth`），故仅在需要时作为"不新增宽度回调"的备选方案。
+8. **codepage flag bit16 恒 0**：初始化实参是 `PFCODE_CP932_Init1(0x20000, NULL)`（bit17），
+   而 `DAT_7100fcfc44` 只保存 `flags & 0x10000` ⇒ `FAT_GetNextPathComponent`、
+   `FAT_MakeShortName` 中的 `(DAT_7100fcfc44._2_1_ & 1) == 0` **恒真**，阅读时可常量折叠。
+   `DAT_7100fcfc48`（Init 的 callback 参数）是**死槽**：写入 NULL、全程序无 READ。
+9. **isOEMMBchar 消费面完整清单**（8 函数 / 13 处引用）：`StringDesc_GetCharCount`、
+   `CompareUnicode`、`CompareOem`、`AddLeft`、`FAT_MatchFileName`、`FAT_GetNextChar`(×2)、
+   `FAT_GetNextPathComponent`(×2)、`FAT_MatchWildcardRecursive`(×3)。
+   补丁"是否覆盖完整"以此清单为准。
 
 ---
 
@@ -57,6 +98,21 @@
 - 改法：与已验证的 6 处同型——`cinc/csel/add #1` → `add wN, wM, w0`（叠加原 +1 后 1/2/3 字节前进 1/2/3）。
 - 待办：从 Ghidra 导出 7 处精确指令字节构造 cmp_bytes/patch_bytes（建议先用脚本核对反汇编，避免手抄）；`csel` 型改 `add` 需确认标志位依赖已被消除（原 csel 的条件分支语义是否仅剩"是否多字节"）。
 - 注：R2 修复后短名空间按 3 字节/CJK 估算，行为更保守（更早放弃短名化、走 LFN），方向正确。
+
+> **2026-09-15 第十九轮复核（本项旧描述已部分过时，以 §6 为准）**
+>
+> - **R1 成立**：`FAT_MatchWildcardRecursive` 确为 `isOEMMBchar`(bool) 消费点，
+>   3 处调用 @`0xf4874`/`0xf49ac`/`0xf4a7c`，+0x14 处即步进指令（已补 @`0xf4888`/`0xf49c4`/`0xf4a90`）。
+> - **R2 归因需修正**：`FAT_MakeShortName` **不是** isMB 问题——宽度取自 `pOEMCharWidth`（ctx+0x28），
+>   取宽度本身正确；缺陷在 2 字节拷贝循环。相关硬编码指令 6 条（循环头 `0xf5ea0`、回边 `0xf5f30`）：
+>   `0xf5ea4` `add w27,w27,#0x2`（短名写指针）、`0xf5ea8` `add w24,w24,#0x2`（源指针）、
+>   `0xf5eac` `subs w23,w23,#0x2`（剩余宽度）、`0xf5ed8` `ldrb w22,[x0,#0x1]`（只读第 2 字节）、
+>   `0xf5eb4` `strb w22,[x8,#0x1]`（只写第 2 字节）、`0xf5ebc` `add w8,w8,#0x2`（长度计数器）。
+>   宽度 3 时 `subs w23,#2` 永不归零 → 死循环，修复点 `0xf5dcc`（`mov w23,w0`→`mov w23,#2`）位置正确。
+> - **R3 误报确认**：`FAT_ReplaceShortNameNumber` 确以 `(*pOEMCharWidth)` 逐字符推进，无需补丁。
+> - **方案选型含义**：GB2312/CP936 汉字为 2 字节，与 CP932 双字节同构 ⇒
+>   该拷贝循环**天然正确**；只有 UTF-8（CJK 3 字节）才需要 R2 这类修复。
+>   这是"CP936 对中文 = 原版 CP932 对日文行为平移"在短名生成路径上的直接证据。
 
 ### P1-2 ｜ R6：`patch_utf16_to_utf8` 补 NUL
 
@@ -136,3 +192,15 @@ section，函数体后放 `<函数名>_end` 汇编标签，运行时尺寸 = 标
 构建期守卫 `sysmod/tools/check_patch_sizes.py` 改为校验：标签距离 == ELF st_size
 （防标签错位）且 ≤ 空洞（FUNCTIONS 表：0xfeac0→0x170、0xfec30→0x1D0、0xfee40→0x4C、
 0xf5840→0x120、0xf7c10→0xD0，换固件版本须重推）。实测尺寸：0xEC/0x7C/0x44/0x110/0x94。
+
+**2026-09-15 第十九轮 Ghidra 复核**（详见 `re_ghidra_round19.md`）
+
+- 独立复核确认：**R2 修复点 `@0xf5dcc` 正确**、**R3 误报判断正确**（依据见 §3 P1-1 复核块），
+  R1 三处步进指令与 isMB 调用点偏移关系吻合。§3 原"三处都按 +1 推进"的描述已加注修正。
+- 本次**仅文档层复核，未改动任何 patch_* 代码** ⇒ `PATCH_SZ` 尺寸与构建守卫不受影响，
+  无需重新 `make`。
+- 新增可复用资产：① 补丁偏移→函数名映射（§1）；② 六回调槽全定性（§2-6）；
+  ③ **isOEMMBchar 消费面 8 函数 / 13 处清单（§2-9）**——后续调整补丁时用此清单核对覆盖面，
+  避免漏改；④ codepage flag bit16 恒 0，可常量折叠（§2-8）。
+- 服务层与结构体侧成果（FsDrvObject 字段定性、FsObject 字段同步、`+0x230=drvObj` 交叉验证等）
+  记于 `re_ghidra_round19.md`，与本方案无直接耦合，不在此展开。

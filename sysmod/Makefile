@@ -208,7 +208,7 @@ PATCHCHECK_PY := $(shell command -v python3 2>/dev/null || command -v python 2>/
 .PHONY: check-patch-sizes
 check-patch-sizes:
 ifdef PATCHCHECK_PY
-	@$(PATCHCHECK_PY) tools/check_patch_sizes.py $(CURDIR)/$(TARGET).elf --main $(CURDIR)/src/main.cpp
+	@$(PATCHCHECK_PY) tools/check_patch_sizes.py $(CURDIR)/$(TARGET).elf --main $(CURDIR)/src/fs_codepage.cpp
 else
 	@echo "warning: python not found, skipping patch size check"
 endif

@@ -7,29 +7,27 @@
   1. 替换函数尺寸标签：(_end 地址 − 函数地址) 必须 == ELF 符号 st_size。
      不等 = 标签错位（如函数被延迟发射到标签之后）→ 运行时尺寸是垃圾值。
   2. 补丁空间：函数尺寸 ≤ 补丁位"空洞"（到下一个存活函数的距离，Ghidra 边界）。
-  3. fs 补丁表（src/main.cpp 的 fs_stages[] / fs_cp_patterns[] / fs_codepage_blobs[]）
-     结构合法：pattern 语法与长度上限、inst_offset 落在 pattern 内、cond 与 patch
-     配套、分组区间连续且 limit_idx 非递减（fs_codepage_patch 靠它 break）。
-     —— 这些表由 fs_encode_fix 侧 _gen_cpp.py 从已验证的 PATTERNS.json 生成，
-        手改极可能破坏上面的不变量。
+  3. fs 补丁表（src/fs_codepage.cpp 的 fs_inst_patches[] / fs_blob_patches[]）
+     结构合法：pattern 语法与长度上限、inst_offset 落在 pattern 内、cond ∈ 谓词清单、
+     cond 与 patch 配套、分组区间连续覆盖两条表。
+     —— 谓词清单是 X 宏 FS_PRED_LIST 的唯一定义处，条目表没有 pred_idx 列，因此
+        「位号与 cond 脱节」在结构上不可能发生；守卫只核对 cond 在白名单里。
   4. pattern 命中（需要 fs 二进制）：每条 pattern 在 fs 的 .text 里**恰好命中 1 次**，
      且命中处 inst_offset 上的指令满足它标注的规则的 cond（函数体替换点则检查
      落点像不像函数入口）。
      —— pattern 驱动定位的安全性完全建立在这两点上：命中 0 次只是不写（安全失败），
         命中 ≥2 次就可能写到别的函数里去。
   5. 现场收割：`patch_str_unicode2oem` / `patch_widechar_compare` 需要 fs 的代码页上下文
-     指针（首个还要的 callee 地址），而这些**逐版本变化**（22 个 fs 二进制实测 ctx 槽有
-     14 个不同地址、callee 有 3 种形状），所以不能写死：补丁器在覆写前从原函数体里收割
+     指针（首个还要的 callee 地址），而这些**逐版本变化**（26 个 fs 变体实测 ctx 槽有
+     18 个不同地址、callee 有 3 种形状），所以不能写死：补丁器在覆写前从原函数体里收割
      原版自己的 `adrp+ldr`（→ 槽）与「跳出函数体的 bl」（→ callee），重编码后填进替换体
      最前的哨兵位。这里查两件事：① 替换体最前必须是固定顺序的占位哨兵（否则运行期判
      FAILED_HARVEST 不写）；② 参考固件上原函数能收割出唯一槽 / 唯一去重 callee（否则同上）。
 
-说明：命令式的补丁字节已不再是"手写常量"，而是由 main.cpp 里 rules_*(inst) 从
-命中到的真实指令现场算出（寄存器/地址/宽度全继承）。因此旧版"校验手写机器码"
-那一项已删除；规则的等价性由离线脚本 _verify_cpp_table.py 在 22 个 fs 二进制、
-682 个站点上验证（patch(cmp) == RESOLVED.patch）。
+说明：命令式的补丁字节不再是"手写常量"，而是由 fs_codepage.cpp 里 rules_*(inst) 从
+命中到的真实指令现场算出（寄存器/地址/宽度全继承），因此没有"校验手写机器码"一项。
 
-用法：check_patch_sizes.py <elf> [--main <main.cpp>] [--fs <fs.kip1>]
+用法：check_patch_sizes.py <elf> [--main <fs_codepage.cpp>] [--fs <fs.kip1>]
 纯标准库实现（自己解析 ELF64 符号表 + 最小 AArch64 判定），不依赖 binutils/capstone。
 """
 
@@ -73,14 +71,25 @@ FUNCTIONS = [
          site_name="PFCODE_Str_Unicode2OEM",
          hole_src="next function 0x71000f5960 (Str_OEM2Unicode)"),
     dict(symbol="patch_stringdesc_toupper", end_symbol="patch_stringdesc_toupper_end",
-         site=0xF7C10, hole=0xD0,
+         site=0xF7C10, hole=0xB0,
          site_name="StringDesc_ToUpper",
-         hole_src="next function 0x71000f7ce0 (PFCODE_CP932_ConvertWidth)"),
+         hole_src="next function 0x71000f7ce0 (PFCODE_CP932_ConvertWidth)；"
+                  "14.x/15.x 实测最小洞 0xB0（0819/081b 的 15.0.1 上为 0xd0），取全局最小 0xB0"),
     dict(symbol="patch_widechar_compare", end_symbol="patch_widechar_compare_end",
          site=0xF4770, hole=0x360,
          site_name="WideChar_Compare",
          hole_src="三种形状的洞 = 0x360(17-20.x) / 0x370(21-22.x) / 0x380(16.1.0)"
                   "（原件函数体实测 0x35c / 0x36c / 0x37c），取最小者 0x360"),
+    dict(symbol="patch_fat_getnextchar", end_symbol="patch_fat_getnextchar_end",
+         site=0xF44E0, hole=0x240,
+         site_name="FAT_GetNextChar",
+         hole_src="入口 = 19.exfat 实测 0xF44E0（守卫/审计脚本按模板命中点核对；"
+                  "0xF44E0 + 0x290 正好是下一个函数 WideChar_Compare 的入口 0xF4770）。"
+                  "48 个固件变体实测（真入口由 bl 目标确定）：洞 0x250(592 B, 22.x) / "
+                  "0x260(608 B, 17.x·21.x) / 0x270(624 B) / 0x280(640 B) / 0x290(656 B)，"
+                  "取最小者 0x250；14.x/15.x 后来实测更小 → 全局最小 0x240(576 B)。"
+                  "⚠️ 启发式函数边界会把入口判后 ~0xbc，进而把洞低估到 "
+                  "0x1a4 —— 必须按 bl 目标确定入口"),
 ]
 
 # 默认 fs 目标二进制（本机 RE 副本）；不存在则跳过 cmp 比对
@@ -157,12 +166,17 @@ def read_by_addr(segments, addr, size):
 # 拷到 fs 后它算出的正是该函数在 fs 中的运行时地址（编译期常量差不变）。
 
 def scan_absolutes(code):
-    """扫描函数体，返回 (可疑绝对地址列表 [(偏移, 说明)], 允许的 fs 上下文槽访问偏移)。
+    """扫描函数体，返回可疑的绝对/外部引用列表 [(偏移, 说明)]。
 
     只关心"像地址的宽常量"：由 MOVZ/MOVK 拼出且最终值 ≥ 0x1000000（16 MiB）。
-    小的合成常量（如返回值 0x00010002、掩码 0xfffffffd 走 MOVN）不误报。"""
+    小的合成常量（如返回值 0x00010002、掩码 0xfffffffd 走 MOVN）不误报。
+
+    ★ P1 之后**唯一**合法的 adrp 用法是「adrp + add 同寄存器」（模块内 PC 相对，
+    拷贝后自洽）。旧版还允许「adrp +0x159000 页增量 + ldr [x,#0xb50]」直接读
+    fs 上下文槽 —— 那条路已被**现场收割**（哨兵占位）取代：槽地址在 26 份变体里
+    有 18 个取值，写死就只能在恰好一份固件上工作。所以现在出现这种编码就是 bug，
+    不再放行（原文的"槽在 0xf5000 页"断言一并删除——它本来就是死代码）。"""
     hits = []
-    slots = []
     reg_val = {}                     # 寄存器 -> 由 MOVZ/MOVK 拼出的当前值
     adrp_regs = {}                   # adrp 目标寄存器 -> 偏移（等它后面的指令）
     for off in range(0, len(code) - 3, 4):
@@ -193,7 +207,7 @@ def scan_absolutes(code):
             if not (0 <= tgt < len(code)):
                 hits.append((off, "B branches outside the function (tail call?)"))
             continue
-        # adrp：只允许两种用法（都必须是 PC 相对）
+        # adrp：只允许「adrp + add 同寄存器」这一种 PC 相对用法
         if (w & 0x9F000000) == 0x90000000:
             adrp_regs[rd] = (off, w)
             continue
@@ -214,45 +228,33 @@ def scan_absolutes(code):
                              % reg_val[rd]))
             continue
         if rd in adrp_regs:
-            base_off, adrp_w = adrp_regs.pop(rd)
-            # 允许用法 1：adrp + add 同寄存器 —— 模块内 PC 相对访问，拷贝后仍自洽
+            base_off, _adrp_w = adrp_regs.pop(rd)
+            # 唯一允许：adrp + add 同寄存器 —— 模块内 PC 相对访问，拷贝后仍自洽
             if ((w >> 24) & 0x1F) == 0b01011 and ((w >> 5) & 0x1F) == rd:
                 continue
-            # 允许用法 2：adrp(+0x159000) + ldr 64-bit [同寄存器, #0xb50]
-            #            = fs+0x24eb50 代码页上下文槽（原版 fs 用的同一寻址方式）
-            immlo = (adrp_w >> 29) & 3
-            immhi = (adrp_w >> 5) & 0x7FFFF
-            imm21 = (immhi << 2) | immlo
-            if imm21 & (1 << 20):
-                imm21 -= 1 << 21
-            ldr64 = ((w >> 22) & 0x3FF) == 0b1111100101 and ((w >> 5) & 0x1F) == rd
-            if ldr64 and imm21 == 0x159 and ((w >> 10) & 0xFFF) == 0x16A:
-                slots.append(base_off)          # fs 上下文槽（PC 相对，允许）
-                continue
-            hits.append((base_off, "ADRP use not allowed (only ADRP+ADD self-relative, or the "
-                                   "fs context slot ADRP +0x159000 / LDR #0xb50): next insn "
-                                   "0x%08X" % w))
+            hits.append((base_off, "ADRP use not allowed (only ADRP+ADD self-relative; the "
+                                   "fs context slot must go through the sentinel harvest, "
+                                   "never a hardcoded page/offset): next insn 0x%08X" % w))
     for base_off, _w in adrp_regs.values():
         hits.append((base_off, "unused ADRP"))
-    return hits, slots
+    return hits
 
 
 
 # ------------------------------------------------- fs 补丁表：解析 + 校验
 #
-# src/main.cpp 里的 fs_stages[] / fs_cp_patterns[] / fs_codepage_blobs[] 由
-# fs_encode_fix 侧的 _gen_cpp.py 从已逐变体验证的 PATTERNS.json 机械生成
-# （离线复核脚本是 _verify_cpp_table.py，覆盖 22 个 fs 二进制 / 682 个站点）。
-# 这里做的是"改完之后仍然自洽"的构建期检查，纯标准库、不依赖 capstone。
+# src/fs_codepage.cpp 里的 fs_inst_patches[] / fs_blob_patches[] 是**手维护的**
+# 权威表（旧的 PATTERNS.json 生成链已不在仓库）。这里做的是"改完之后仍然自洽"
+# 的构建期检查，纯标准库、不依赖 capstone。
 #
 # fs 补丁的安全性完全建立在「每条 pattern 在目标 .text 里恰好唯一命中一次」上：
 # 命中 0 次只是不写（安全失败），命中 ≥2 次就可能写到别的函数里去。
 
-PATTERN_MAX = 60          # PatternData::data[60]
+PATTERN_MAX = 60          # PatternData::data[60]（单点写法下 槽数 == 模板字节数）
 
-# --- 现场收割（哨兵占位对）：与 main.cpp 的 FS_*_SENTINEL_* 常量一致 -------------
-# 有些替换体不能写死「全局槽地址」或「被调用函数的地址」——它们逐版本变化（22 份 fs
-# 实测槽地址有 14 个取值、callee 有 3 种形状）。补丁器在覆写前从**原函数体**里收割：
+# --- 现场收割（哨兵占位对）：与 fs_codepage.cpp 的 FS_*_SENTINEL_* 常量一致 -------------
+# 有些替换体不能写死「全局槽地址」或「被调用函数的地址」——它们逐版本变化（26 份 fs
+# 变体实测槽地址有 18 个取值、callee 有 3 种形状）。补丁器在覆写前从**原函数体**里收割：
 #   · ctx 槽  ← 原件里唯一的 `adrp + ldr` 对（Rd=Rn=Rt）
 #   · callee  ← 原件里目标跳出函数体的 bl 的**去重目标**
 # 再按占位指令自身的真实地址重编码成 `adrp+add` 覆写函数体**最前面**的哨兵。
@@ -261,34 +263,37 @@ FS_CTX_SENTINELS = (0xDEAD0001, 0xDEAD0002)
 FS_CALL_SENTINELS = (0xDEAD0003, 0xDEAD0004)
 FS_CTX_SCAN = 0x120            # 原件 ctx 扫描窗口（= 最小洞 0x120）
 FS_CALL_SCAN = 0x300           # 原件 callee 扫描窗口（≥ 最后一条外跳 bl 的偏移、
-                               #  < 最小函数体 0x35c；与 main.cpp 的 FS_CALL_SCAN 一致）
-FS_CTX_MAX_DELTA = 0x400000    # 槽与代码的合理最大距离（22 份实测 1.3~1.7 MB）
+                               #  < 最小函数体 0x35c；与 fs_codepage.cpp 的 FS_CALL_SCAN 一致）
+FS_CTX_MAX_DELTA = 0x400000    # 槽与代码的合理最大距离（26 份实测 1.3~1.7 MB）
 
 # 需要现场收割的替换体（ELF 符号名）-> 期望的函数体最前哨兵字序列
 HARVEST_BLOBS = {
     "patch_str_unicode2oem":  FS_CTX_SENTINELS,                        # 只 ctx 对
     "patch_widechar_compare": FS_CTX_SENTINELS + FS_CALL_SENTINELS,    # ctx 对 + callee 对
+    "patch_fat_getnextchar":  FS_CTX_SENTINELS,                        # 只 ctx 对
 }
-# 需要查收割可行性的 blob 实现名（对应 fs_codepage_blobs[] 的 FsBlobImpl）
-HARVEST_IMPLS = {"StrUnicode2Oem", "WideCharCompare"}
+# 需要查收割可行性的 blob 实现名（对应 fs_blob_patches[] 的 FsBlobImpl）
+HARVEST_IMPLS = {"StrUnicode2Oem", "WideCharCompare", "FatGetNextChar"}
 
+# 条目表（手维护，改格式时这里必须同步：解析不出来 = 静默跳过 = 不校验）
+# 条目名 = `<功能名>_<版本范围>`（如 fs_cp_makeshortname_15.0.1-20.5.0），故名字字符集
+# 必须允许 `. + - ,`——不然整表 0 命中、守卫"通过"却什么都没查（踩过）。
+#   fs_inst_patches[]: { "name", "0x…pattern", inst_offset, cond, patch }
+#   fs_blob_patches[]: { "name", "0x…pattern", entry_offset, FsBlobImpl::Impl }
 PAT_RE = re.compile(
-    r'\{\s*"(\w+)",\s*"(0x[0-9A-Fa-f.]+)",\s*(-?\d+),\s*0,\s*'
-    r'(\w+),\s*(\w+),\s*(\d+),\s*(\d+),\s*(true|false)\s*,\s*(true|false)\s*\}')
+    r'\{\s*"([A-Za-z0-9_.,+-]+)",\s*"(0x[0-9A-Fa-f.]+)",\s*(-?\d+),\s*'
+    r'(\w+),\s*(\w+)\s*\}')
 BLOB_RE = re.compile(
-    r'\{\s*"(\w+)",\s*"(0x[0-9A-Fa-f.]+)",\s*(-?\d+),\s*FsBlobImpl::(\w+),'
-    r'\s*(\d+),\s*(true|false)\s*\}')
+    r'\{\s*"([A-Za-z0-9_.,+-]+)",\s*"(0x[0-9A-Fa-f.]+)",\s*(-?\d+),\s*FsBlobImpl::(\w+)\s*\}')
 # FsFnGroup: label, pat_begin, pat_end, blob_begin, blob_end
 GROUP_RE = re.compile(r'\{\s*"(\w+)\s*",\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+)\s*\}')
-PRED_COUNT_RE = re.compile(r"constexpr\s+u32\s+FS_PRED_COUNT\s*=\s*(\d+)\s*;")
-PRED_NAME_RE = re.compile(r'"(rules_is_\w+)"')
-PRED_MASK_RE = re.compile(
-    r"if\s*\(nmask\s*&\s*\(1u\s*<<\s*(\d+)\)\)\s*\{\s*if\s*\((\w+)\(inst\)\)")
+# 谓词清单的唯一来源：X 宏 FS_PRED_LIST(X) 里 `X(名字)` 的出现次序 = 位号。
+# fs_preds[] 与 fs_pred_mask() 都由这个宏展开 ⇒ 「位号 ↔ 名字」不可能脱节，
+# 守卫只需取出名字当白名单，核对每个条目的 cond 在其中。
+PRED_LIST_RE = re.compile(r'X\(\s*(rules_is_\w+)\s*\)')
 
 BLOB_IMPLS = {"Utf16ToUtf8", "Utf8ToUtf16", "IsOemMbChar", "StrUnicode2Oem",
-              "StrDescToUpper", "WideCharCompare"}
-
-STAGE_IDX_MAX = 6     # 与原版 7 个语义 stage 一致（fs_stage_limit 默认 6）
+              "StrDescToUpper", "WideCharCompare", "FatGetNextChar"}
 
 
 def array_body(src, decl):
@@ -312,7 +317,7 @@ def _bits(w, hi, lo):
 
 
 # patch 函数名 -> (必须配套的 cond 名, cond 的位域判定)。
-# 与 src/main.cpp 的 rules_is_* / rules_* 一一对应，改规则时必须同步改这里。
+# 与 src/fs_codepage.cpp 的 rules_is_* / rules_* 一一对应，改规则时必须同步改这里。
 RULE_PATCHES = {
     "rules_nop": ("rules_is_bcond",
                   lambda w: (w & 0xFF000010) == 0x54000000),
@@ -359,51 +364,49 @@ def strip_comments(src):
     return src
 
 
-def parse_fs_tables(main_cpp):
-    """从 main.cpp 抽出四张表：谓词表、函数组表、指令改写表、整函数体替换表。
+def parse_fs_tables(fs_cpp):
+    """从 fs 补丁源码抽出四张表：谓词表、函数组表、指令改写表、整函数体替换表。
 
-    返回 (preds, pats, blobs, groups)。preds 是 dict，含谓词个数、名字表、位图直调表。"""
-    with open(main_cpp, "r", encoding="utf-8") as f:
+    返回 (preds, pats, blobs, groups)。preds 是 dict：n = 谓词个数 = 表中
+    cond 的合法取值集合（名字清单）。"""
+    with open(fs_cpp, "r", encoding="utf-8") as f:
         src = strip_comments(f.read())
 
-    mc = PRED_COUNT_RE.search(src)
-    preds = dict(
-        n=int(mc.group(1)) if mc else 0,
-        names=[m.group(1) for m in
-               PRED_NAME_RE.finditer(array_body(src, "fs_pred_names"))],
-        mask=[(int(m.group(1)), m.group(2)) for m in
-              PRED_MASK_RE.finditer(array_body(src, "fs_pred_mask"))],
-    )
+    # 谓词清单：X 宏体里 X(名字) 的出现次序即位号。
+    pred_names = [m.group(1) for m in PRED_LIST_RE.finditer(src)]
+    preds = dict(n=len(pred_names), names=pred_names)
 
     groups = [dict(label=m.group(1), pb=int(m.group(2)), pe=int(m.group(3)),
                    bb=int(m.group(4)), be=int(m.group(5)))
               for m in GROUP_RE.finditer(array_body(src, "fs_fn_groups"))]
     pats = [dict(name=m.group(1), pattern=m.group(2), inst_offset=int(m.group(3)),
-                 cond=m.group(4), patch=m.group(5), pred_idx=int(m.group(6)),
-                 stage_idx=int(m.group(7)), wide=(m.group(8) == "true"),
-                 enabled=(m.group(9) == "true"))
-            for m in PAT_RE.finditer(array_body(src, "fs_cp_patterns"))]
+                 cond=m.group(4), patch=m.group(5))
+            for m in PAT_RE.finditer(array_body(src, "fs_inst_patches"))]
     blobs = [dict(name=m.group(1), pattern=m.group(2), inst_offset=int(m.group(3)),
-                  impl=m.group(4), stage_idx=int(m.group(5)),
-                  wide=(m.group(6) == "true"))
-             for m in BLOB_RE.finditer(array_body(src, "fs_codepage_blobs"))]
+                  impl=m.group(4))
+             for m in BLOB_RE.finditer(array_body(src, "fs_blob_patches"))]
     return preds, pats, blobs, groups
 
 
 def parse_pattern(s):
-    """'0xAB..CD' -> [0xAB, None, 0xCD]；非法返回 None。"""
+    """'0xAB.CD' -> [0xAB, None, 0xCD]；非法返回 None。
+
+    逐字符解析，与 patch_types.h 的 `str2hex` 完全同构：**一个 `.` = 一个通配槽**。
+    相邻两个 '.' 就是两个独立的通配字节（本身完全合法）。槽与固件字节错位时
+    模板永远匹配不上 —— 下面的「唯一命中」检查是最终兜底。"""
     body = s[2:]
-    if len(body) % 2:
-        return None
     out = []
-    for i in range(0, len(body), 2):
-        pair = body[i:i + 2]
-        if pair == "..":
+    i = 0
+    while i < len(body):
+        if body[i] == ".":
             out.append(None)
-        elif re.fullmatch(r"[0-9A-Fa-f]{2}", pair):
-            out.append(int(pair, 16))
+            i += 1
         else:
-            return None
+            pair = body[i:i + 2]
+            if not re.fullmatch(r"[0-9A-Fa-f]{2}", pair):
+                return None
+            out.append(int(pair, 16))
+            i += 2
     return out
 
 
@@ -460,14 +463,25 @@ def kip1_text(data):
     return data[0x100 + off:0x100 + off + size]
 
 
+# 条目名规则：`<功能名>_<版本范围>`（范围沿用原 sys-patch 约定：`a.b.c-d.e.f` 闭区间 /
+# `a.b.c+` 开区间；非连续覆盖用 `,` 分段）。功能前缀 = 族（补丁点）标识，
+# 与 fs_codepage.cpp 的 fs_family_of() 同口径。
+_VER_ITEM = r"\d+\.\d+\.\d+(?:-\d+\.\d+\.\d+)?\+?"
+NAME_RE = re.compile(r"^(?P<point>fs_cp_[a-z0-9_]+?)_(?P<ver>" + _VER_ITEM +
+                     r"(?:," + _VER_ITEM + r")*)$")
+
+
 def point_of(name):
-    """'fs_cp_p07_fat_getnextchar' -> 7；名字里没有 _pNN_ 的各自独立成点（-1）。"""
-    m = re.search(r"_p(\d+)_", name)
-    return int(m.group(1)) if m else -1
+    """'fs_cp_makeshortname_14.1.2,21.0.0+' -> 'fs_cp_makeshortname'；不合规返回 None。
+
+    族 = 名字里版本范围之前的功能前缀（与 fs_family_of 同口径）。名字不合规会让该条目
+    退化成「不参与兄弟退役」（只是变慢，仍正确），所以要报错而不是静默。"""
+    m = NAME_RE.match(name)
+    return m.group("point") if m else None
 
 
 def _adrp_page(w, pc):
-    """复刻 main.cpp fs_adrp_page：由 adrp 指令字 + 指令地址解出目标页。"""
+    """复刻 fs_codepage.cpp fs_adrp_page：由 adrp 指令字 + 指令地址解出目标页。"""
     imm = (((w >> 5) & 0x7FFFF) << 2) | ((w >> 29) & 3)
     if imm & (1 << 20):
         imm -= 1 << 21
@@ -475,7 +489,7 @@ def _adrp_page(w, pc):
 
 
 def ctx_harvest_problem(text, site):
-    """复刻 main.cpp fs_harvest_ctx_pair 的判据，看参考固件上能不能收割到 ctx 取指对。
+    """复刻 fs_codepage.cpp fs_harvest_ctx_pair 的判据，看参考固件上能不能收割到 ctx 取指对。
 
     返回 None = 能收割；否则返回失败原因。这条检查很关键：收割不到时补丁器会**整点
     跳过不写**（安全失败），但那意味着该固件上 H1 溢出修复失效 —— 换参考固件后必须
@@ -534,7 +548,7 @@ def sentinel_problem(blob, sent):
 
 
 def callee_harvest_problem(text, site, span=FS_CALL_SCAN):
-    """复刻 main.cpp fs_harvest_callee 的判据：原件前 span 字节里「目标跳出函数体」的 bl
+    """复刻 fs_codepage.cpp fs_harvest_callee 的判据：原件前 span 字节里「目标跳出函数体」的 bl
     的**去重目标**必须恰好 1 个（M6 实测有 3 条 bl 指向同一个 callee）。
 
     返回 None = 能收割；否则返回失败原因。收不到 ⇒ 该点整点不写（安全失败），
@@ -565,21 +579,22 @@ def callee_harvest_problem(text, site, span=FS_CALL_SCAN):
     return None
 
 
-def check_fs_tables(main_cpp, fs_data, errors, warnings, partial_ok):
+def check_fs_tables(fs_cpp, fs_data, errors, warnings, partial_ok):
     """谓词表 + 函数组两级表 + 唯一命中 + 落点指令。返回 (打印行, pattern 数, blob 数)。
 
     检查项（任一失败都可能让补丁写错地方）：
-      1. 谓词表自洽：FS_PRED_COUNT == 名字表长度 == 位图直调表的位号集合；
-         fs_pred_mask 第 k 位必须调 fs_pred_names[k]（位图和条目 pred_idx 靠它对齐）。
+      1. 谓词清单：FS_PRED_LIST 里 X(名字) 的次序即位号，名字不重复、个数 ≤ 32。
+         （fs_preds[] / fs_pred_mask() 都由同一宏展开，位号与名字不可能脱节。）
       2. 条目结构：pattern 语法/长度、inst_offset 越界、inst_offset % 4（M3 按字索引）、
-         cond 与 patch 配套、stage_idx 范围、pred_idx 指向的谓词必须就是该条目的 cond。
+         cond 在白名单里、cond 与 patch 配套。
+         （条目**没有** stage 分级：补丁要么整份生效，要么 [options] fs_codepage=0 整份跳过。）
       3. 函数组区间连续覆盖两条表，且组不空。
       4. 每条 pattern 在 fs .text 恰好命中 1 次、命中位置字对齐、落点指令满足 cond。
     """
     try:
-        preds, pats, blobs, groups = parse_fs_tables(main_cpp)
+        preds, pats, blobs, groups = parse_fs_tables(fs_cpp)
     except OSError as e:
-        sys.exit("error: cannot read main source: %s" % e)
+        sys.exit("error: cannot read fs patch source: %s" % e)
 
     row = "  %-30s %-8s %-10s %-5s %s"
     lines = [row % ("NAME", "KIND", "SITE", "HITS", "STATUS")]
@@ -589,20 +604,13 @@ def check_fs_tables(main_cpp, fs_data, errors, warnings, partial_ok):
                       "表被删了/格式被改了？" % (len(pats), len(blobs), len(groups)))
         return lines, len(pats), len(blobs)
 
-    # ---- 1. 谓词表自洽
-    if preds["n"] != len(preds["names"]):
-        errors.append("FS_PRED_COUNT=%d 与 fs_pred_names 的 %d 项不一致"
-                      % (preds["n"], len(preds["names"])))
+    # ---- 1. 谓词清单（X 宏 FS_PRED_LIST 是唯一定义处，名字出现次序 = 位号）
+    if not preds["names"]:
+        errors.append("谓词清单为空 —— FS_PRED_LIST 没解析出来（宏被改名/删了？）")
     if preds["n"] > 32:
-        errors.append("FS_PRED_COUNT=%d > 32 —— 位图塞不进一个 u32" % preds["n"])
-    if [i for i, _ in preds["mask"]] != list(range(len(preds["names"]))):
-        errors.append("fs_pred_mask 的位号 %s 与谓词表 0..%d 不连续/不匹配"
-                      % ([i for i, _ in preds["mask"]], len(preds["names"]) - 1))
-    for i, nm in preds["mask"]:
-        if i >= len(preds["names"]) or preds["names"][i] != nm:
-            errors.append("fs_pred_mask 位 %d 调用 %s，但谓词表里是 %s —— "
-                          "条目 pred_idx 会指错谓词"
-                          % (i, nm, preds["names"][i] if i < len(preds["names"]) else "<缺失>"))
+        errors.append("谓词数 %d > 32 —— 位图塞不进一个 u32" % preds["n"])
+    if len(set(preds["names"])) != preds["n"]:
+        errors.append("谓词清单有重名：%s" % " ".join(preds["names"]))
 
     # ---- 2. 条目结构
     seen = set()
@@ -610,11 +618,10 @@ def check_fs_tables(main_cpp, fs_data, errors, warnings, partial_ok):
         if e["name"] in seen:
             errors.append("fs 补丁表里有重复的 patch_name: %s" % e["name"])
         seen.add(e["name"])
-        if e["name"] in ("stage", "wide_cmp"):
-            errors.append("patch_name %s 与 [fs_codepage] 的配置键冲突" % e["name"])
         p = parse_pattern(e["pattern"])
         if p is None:
-            errors.append("%s: pattern 语法非法 (%s)" % (e["name"], e["pattern"]))
+            errors.append("%s: pattern 语法非法 (%s) —— 一个十六进制字符对 = 一个字节，"
+                          "一个 `.` = 一个通配槽" % (e["name"], e["pattern"]))
             continue
         if len(p) > PATTERN_MAX:
             errors.append("%s: pattern %d 字节 > PatternData 容量 %d"
@@ -634,27 +641,35 @@ def check_fs_tables(main_cpp, fs_data, errors, warnings, partial_ok):
             if e["cond"] != want_cond:
                 errors.append("%s: cond %s 与 patch %s 不配套（应为 %s）"
                               % (e["name"], e["cond"], e["patch"], want_cond))
-        if not e["enabled"]:
-            errors.append("%s: enabled=false —— fs 补丁表的条目一律应为 true"
-                          "（门控用 stage_idx / needs_wide_cmp 表达）" % e["name"])
-        if not (0 <= e["stage_idx"] <= STAGE_IDX_MAX):
-            errors.append("%s: stage_idx %d 超出 0..%d"
-                          % (e["name"], e["stage_idx"], STAGE_IDX_MAX))
-        names = preds["names"]
-        if not (0 <= e["pred_idx"] < len(names)):
-            errors.append("%s: pred_idx %d 越界（谓词表 %d 个）"
-                          % (e["name"], e["pred_idx"], len(names)))
-        elif names[e["pred_idx"]] != e["cond"]:
-            errors.append("%s: pred_idx %d 指向 %s，但该条目的 cond 是 %s —— "
-                          "位图用它当预筛，必须是同一个谓词"
-                          % (e["name"], e["pred_idx"], names[e["pred_idx"]], e["cond"]))
+        # cond 必须在谓词清单里：不在 ⇒ 位图永不置位 ⇒ 该条目运行期永远命中不了
+        if e["cond"] not in preds["names"]:
+            errors.append("%s: cond %s 不在谓词清单 FS_PRED_LIST 里 —— "
+                          "fs_pred_index 会返回越界值，该条目永远命中不了"
+                          % (e["name"], e["cond"]))
     for e in blobs:
         if e["impl"] not in BLOB_IMPLS:
             errors.append("%s: 未知的替换实现 FsBlobImpl::%s" % (e["name"], e["impl"]))
-        # 门控与 FsPat 同口径（M6 的替换体只在 wide_cmp=1 时应用）
-        if not (0 <= e["stage_idx"] <= STAGE_IDX_MAX):
-            errors.append("%s: blob 的 stage_idx %d 超出 0..%d"
-                          % (e["name"], e["stage_idx"], STAGE_IDX_MAX))
+
+    # ---- 2b. 族（补丁点）与 blob 车道筛子 ------------------------------------
+    # fs_codepage.cpp 有两处**从数据推导出来的结构**，错了不会编译失败、只会静默失效，
+    # 所以必须在这里钉住：
+    #   · 族号 = 名字里**版本范围之前的功能前缀**（fs_family_of）。同族是跨版本互斥变体，
+    #     任一成员定位成功即让同族其余成员提前退役 ⇒ 名字不合规会退化成"不跳兄弟"
+    #     （只是变慢，仍正确），但意味着优化失效，要报出来。
+    #   · blob 车道筛子：模板偏移 0（否则偏移 4）必须有一个**确定字节**当筛子。若两处
+    #     都是通配槽，该条目退化成"每个位置都试"（仍正确，只是慢）。
+    for e in pats + blobs:
+        if point_of(e["name"]) is None:
+            errors.append("%s: 名字不是 `<功能名>_<版本范围>` 形式（如 "
+                          "fs_cp_makeshortname_15.0.1-20.5.0）—— fs_family_of() 取不到族前缀，"
+                          "该条目不参与兄弟退役（优化静默失效）" % e["name"])
+    for e in blobs:
+        p = parse_pattern(e["pattern"])
+        if p is None:
+            continue
+        if len(p) < 5 or (p[0] is None and p[4] is None):
+            errors.append("%s: 模板偏移 0 与 4 都是通配槽 —— blob 车道快筛对它无效"
+                          "（退化成逐位置全试）" % e["name"])
 
     # ---- 3. 函数组区间：连续覆盖两条表，组不能空
     pi = bi = 0
@@ -689,13 +704,25 @@ def check_fs_tables(main_cpp, fs_data, errors, warnings, partial_ok):
 
     # 一个补丁点可能有多条"变体族"pattern（例：#17 的 bfi 形式只存在于 16.1.0，
     # orr lsl#8 形式只存在于 20.x+；#10 的 8 组/14 组两族）。任何一份固件只会命中
-    # 其中一族，因此"命中 0 次"是否算错误，要按整个补丁点（名字里的 pNN）汇总判断：
+    # 其中一族，因此"命中 0 次"是否算错误，要按整个补丁点（名字里的功能前缀）汇总判断：
     #   点内 ≥1 族命中 -> 该点已覆盖，未命中的族只是"不适用于本固件"（warning）
     #   点内 0 族命中   -> 这个点在目标固件上根本没定位到（error）
     point_hits = collections.defaultdict(int)
     for e, _kind, hits in hits_by:
         if hits:
             point_hits[point_of(e["name"])] += len(hits)
+
+    # 族互斥 =「兄弟提前退役」的安全前提：同族条目在**同一份固件**上至多 1 条命中。
+    # 若这条不成立，退役会把本该应用的补丁跳掉 ⇒ 必须在参考固件上逐族验一遍。
+    fam_hits = collections.defaultdict(list)
+    for e, _kind, hits in hits_by:
+        if hits:
+            fam_hits[point_of(e["name"])].append(e["name"])
+    for pt, names in sorted(fam_hits.items(), key=lambda kv: kv[0] or ""):
+        if len(names) > 1:
+            errors.append("补丁点 %s 在参考固件上同时命中 %d 条（%s）—— 族内互斥不成立，"
+                          "「兄弟提前退役」会漏掉本该应用的补丁；该点的变体族必须互斥"
+                          % (pt, len(names), ", ".join(names)))
 
     for e, kind, hits in hits_by:
         if hits is None:
@@ -740,7 +767,7 @@ def check_fs_tables(main_cpp, fs_data, errors, warnings, partial_ok):
 
         pt = point_of(e["name"])
         if len(hits) == 0 and partial_ok and point_hits[pt] > 0:
-            warnings.append("%s: 本固件 0 命中，但补丁点 p%02d 已由其它变体族命中 "
+            warnings.append("%s: 本固件 0 命中，但补丁点 %s 已由其它变体族命中 "
                             "-> 版本族差异，跳过（非错误）" % (e["name"], pt))
             lines.append(row % (e["name"], kind, "-", "0", "skipped (other family)"))
         else:
@@ -758,8 +785,8 @@ def check_fs_tables(main_cpp, fs_data, errors, warnings, partial_ok):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("elf")
-    ap.add_argument("--main", default="src/main.cpp",
-                    help="main.cpp 路径（默认相对 sysmod 目录）")
+    ap.add_argument("--main", default="src/fs_codepage.cpp",
+                    help="fs 补丁源码路径（默认相对 sysmod 目录）")
     ap.add_argument("--fs", default=os.environ.get("FS_KIP1", DEFAULT_FS),
                     help="fs 目标二进制（用于 cmp 字节比对；缺失则跳过）")
     args = ap.parse_args()
@@ -802,6 +829,14 @@ def main():
             errors.append("%s: size 0x%X exceeds hole 0x%X at site 0x%X (%s) -- would overwrite %s"
                           % (sym, delta, hole, entry["site"], entry["site_name"], entry["hole_src"]))
             status.append("HOLE OVERFLOW")
+        elif delta == hole:
+            # 零余量：现在过得了，但任何一次无害的源码调整（多一条 nop、寄存器分配变了、
+            # 编译器换了版本）都会立刻变成 HOLE OVERFLOW。洞是 fs 函数边界定的、不可挪，
+            # 所以唯一的出路是把这个替换体写小一点 —— 别等它某天突然构建失败。
+            warnings.append("%s: ZERO SLACK -- size 0x%X == hole 0x%X at site 0x%X (%s); "
+                            "any codegen growth breaks the build, shrink the replacement"
+                            % (sym, delta, hole, entry["site"], entry["site_name"]))
+            status.append("ZERO SLACK")
         rows.append((sym, "0x%X" % fsize, "0x%X" % delta, hole,
                      "OK" if not status else " / ".join(status)))
     for sym, fsize, delta, hole, status in rows:
@@ -840,7 +875,7 @@ def main():
                           "position-independence" % sym)
             print(header % (sym, "-", "-", "", "BYTES NOT FOUND"))
             continue
-        hits, slots = scan_absolutes(blob)
+        hits = scan_absolutes(blob)
 
         # 带哨兵占位的替换体：哨兵必须各自恰好 1 次、成对相邻、按序（补丁器按内容
         # 线性搜索占位对，按占位指令自身的真实地址重编码 adrp+add 覆写它们）
@@ -850,14 +885,6 @@ def main():
             if why:
                 errors.append("%s: 收割哨兵 %s 不合格 —— %s；补丁器会判 FAILED_HARVEST "
                               "整点不写（该点补丁失效）" % (sym, want_sent, why))
-        for off in slots:
-            # 页增量 0x159 是相对"该指令所在页"的；它必须仍落在 fs+0xf5000 页，
-            # 否则算出的槽地址不是 fs+0x24eb50（洞约束保证函数不跨页，这里做显式断言）
-            if ((entry["site"] + off) & ~0xFFF) != 0xF5000:
-                errors.append("%s: context-slot ADRP at +0x%X would land in page 0x%X, "
-                              "not 0xf5000 -- the +0x159000 page delta assumes the function "
-                              "sits in fs page 0xf5000 (site 0x%X) and must not straddle pages"
-                              % (sym, off, (entry["site"] + off) & ~0xFFF, entry["site"]))
         for off, why in hits:
             errors.append("%s: absolute/external reference in copied code at +0x%X: %s "
                           "-- load address is randomized (ASLR); only PC-relative "

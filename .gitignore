@@ -16,3 +16,6 @@ ignoreme
 .tmp/
 .workbuddy/
 .vscode/settings.json
+__pycache__/
+*.pyc
+*.lst

@@ -67,6 +67,38 @@ The memory footprint *(16kib)* and the binary size *(~50kib)* are both very smal
 
 ---
 
+## Fork addition: UTF-8 (Chinese) file names in **fs**
+
+This fork adds `fs_codepage_patch()`: it replaces fs's CP932 (Shift-JIS) ↔ UTF-16 routines with
+UTF-8 ↔ UTF-16 and patches the call sites, so **FAT/exFAT entries whose names contain 3-byte CJK
+characters can be listed, opened and created** (Stock firmware shows them as garbage or fails to open them).
+
+It is **pattern-driven** — the tables carry byte templates, not offsets — so one build covers every
+fs variant from **14.1.2 to 22.5.0** (26 binaries, 14 patch points each) and a new firmware needs no
+new offsets. Every change is verified at build time by `sysmod/tools/check_patch_sizes.py`
+(function sizes + holes, unique pattern hits, ASLR/position-independence of the copied code).
+
+Config (`/config/sys-patch/config.ini`, written with defaults on first run):
+
+```ini
+[options]
+fs_codepage=1     ; 0 = skip the whole fs codepage patch (escape hatch, no rebuild needed)
+```
+
+There is no partial / bisect switch — no per-entry flags: the table is applied all-or-nothing
+(a half-applied table is dangerous: a replaced converter without its paired width clamp hangs
+`FAT_MakeShortName`), so if you need to rule the patch out, turn the whole thing off.
+
+If fs hangs after a patch, it can no longer write to the SD, so the last value of
+`[debug] fs_codepage_patch_result` in `log.ini` names the function group that broke it.
+The `[fs_codepage]` log section then lists the entries that located (failures stand out as
+`Failed (...)`), `[debug] fs_codepage_unmatched` counts the rest, and `[fs_codepage_sites]` gives every
+hit offset.
+Design + implementation notes (Chinese): `fs_encode_fix/re_utf8_patch_final.md`.
+Doc hierarchy / index: `fs_encode_fix/README.md`.
+
+---
+
 ## FAQ:
 
 ### If I am using sigpatches already, is there any point in using this?
